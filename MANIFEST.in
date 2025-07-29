@@ -1,0 +1,54 @@
+# Include the README and other important files
+include README.md
+include CLAUDE.md
+include LICENSE
+include requirements.txt
+include .gitignore
+
+# Include documentation
+include *.md
+recursive-include docs *.md *.rst *.txt
+
+# Include test files
+recursive-include tests *.py
+recursive-include tests/fixtures *
+
+# Include parsers and pipeline modules
+recursive-include parsers *.py
+recursive-include pipeline *.py
+
+# Include configuration files
+include *.json
+include *.toml
+include *.yml
+include *.yaml
+
+# Include scripts and utilities
+include run_tests.py
+include *.sh
+
+# Include TypeScript parser dependencies
+include package.json
+include package-lock.json
+include *.js
+include *.cjs
+
+# Include source files for other language parsers
+include *.go
+include *.rs
+include Cargo.toml
+include Cargo.lock
+
+# Exclude cache and build artifacts
+prune cache
+prune compressed_output
+prune target
+prune node_modules
+prune __pycache__
+prune .pytest_cache
+prune htmlcov
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.pkl
+global-exclude .DS_Store
+global-exclude *.log

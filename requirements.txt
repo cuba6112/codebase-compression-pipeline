@@ -1,0 +1,24 @@
+# Core dependencies for codebase compression pipeline
+lz4>=4.0.0
+mmh3>=3.0.0
+psutil>=5.9.0
+tqdm>=4.65.0
+
+# Async support
+aiofiles>=23.0.0
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.10.0
+pytest-cov>=4.0.0
+
+# Optional dependencies for enhanced features
+python-magic>=0.4.27  # For file type detection
+redis>=4.5.0  # For distributed caching (optional)
+
+# Development dependencies
+black>=23.0.0  # Code formatting
+flake8>=6.0.0  # Linting
+mypy>=1.0.0  # Type checking
+pre-commit>=3.0.0  # Git hooks
