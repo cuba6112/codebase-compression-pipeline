@@ -38,8 +38,11 @@ class PythonParser(LanguageParser, TokenizerMixin, ParserMixin):
             logger.warning(f"Syntax error parsing {filepath}: {e}")
             # Fall back to regex-based parsing for basic structure
             self._fallback_parse(content, metadata)
+        except UnicodeDecodeError as e:
+            logger.error(f"Encoding error parsing {filepath}: {e}")
+            self._fallback_parse(content, metadata)
         except Exception as e:
-            logger.error(f"Unexpected error parsing {filepath}: {e}")
+            logger.error(f"Unexpected error parsing {filepath}: {e}", exc_info=True)
             self._fallback_parse(content, metadata)
         
         metadata.token_count = len(self.tokenize(content))

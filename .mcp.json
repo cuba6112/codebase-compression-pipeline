@@ -1,0 +1,93 @@
+{
+  "mcpServers": {
+    "claude-code": {
+      "command": "claude-code-mcp",
+      "env": {
+        "CLAUDE_CLI_PATH": "claude"
+      }
+    },
+    "n8n-mcp": {
+      "command": "node",
+      "args": ["/Users/cuba6112/n8n-mcp/dist/mcp/index.js"],
+      "env": {
+        "MCP_MODE": "stdio",
+        "LOG_LEVEL": "error",
+        "DISABLE_CONSOLE_OUTPUT": "true",
+        "N8N_API_URL": "http://localhost:5678/api/",
+        "N8N_API_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjY3ODA1OS00MjhkLTRhMzMtYjQ3YS05NDI5YmRiZmUzOTgiLCJpc3MiOiJuOG4iLCJhdWQiOiJwdWJsaWMtYXBpIiwiaWF0IjoxNzUzNjIwNDEwfQ.zNHqoFnSYrxaIWF5Fl7W4gh4aZdsTxzA-X7riTzZrUo"
+      }
+    },
+    "MCP_DOCKER": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-l",
+        "mcp.client=claude-desktop",
+        "--rm",
+        "-i",
+        "alpine/socat",
+        "STDIO",
+        "TCP:host.docker.internal:8811"
+      ]
+    },
+    "RepoPrompt": {
+      "args": [
+        "--no-bonjour",
+        "--timeout", "60"
+      ],
+      "command": "/Applications/Repo Prompt.app/Contents/MacOS/repoprompt-mcp"
+    },
+    "Deep Graph MCP": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-code-graph@latest",
+        "cuba6112/SuperClaude"
+      ]
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    },
+    "neo4j": {
+      "command": "/Users/cuba6112/.local/bin/uvx",
+      "args": [
+        "mcp-neo4j-memory@0.1.5",
+        "--db-url",
+        "bolt://127.0.0.1:7687",
+        "--username",
+        "neo4j",
+        "--password",
+        "maxlin83"
+      ]
+    },
+    "obsidian-mcp-tools": {
+      "command": "Users/cuba6112/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-notes-Munoz/.obsidian/plugins/mcp-tools/bin/mcp-server",
+      "env": {
+        "OBSIDIAN_API_KEY": "8a05446c67386aaef2dd92e1d0d607f669174fcf4e66b6e3a4a4e93b83f50e77"
+      }
+    },
+    "MCP_DOCX": {
+      "command": "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+      "args": [
+        "/Users/cuba6112/mcp-doc/server.py"
+      ]
+    },
+    "desktop-commander": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "@wonderwhy-er/desktop-commander",
+        "--key",
+        "70872288-7718-4f12-8ee6-bcf34fab1d77",
+        "--profile",
+        "anonymous-ape-y6pwdA"
+      ]
+    }
+  }
+}

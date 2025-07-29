@@ -84,8 +84,14 @@ class EnhancedJavaScriptParser(LanguageParser):
                 else:
                     logger.warning("Node.js not available, falling back to regex parser")
                     self.use_node_parser = False
-            except Exception:
-                logger.warning("Node.js not available, falling back to regex parser")
+            except FileNotFoundError:
+                logger.warning("Node.js executable not found, falling back to regex parser")
+                self.use_node_parser = False
+            except subprocess.CalledProcessError:
+                logger.warning("Node.js execution error, falling back to regex parser")
+                self.use_node_parser = False
+            except Exception as e:
+                logger.warning(f"Unexpected error checking Node.js: {e}, falling back to regex parser")
                 self.use_node_parser = False
                 
     def parse(self, content: str, filepath: str) -> FileMetadata:

@@ -155,8 +155,12 @@ class ParallelProcessor:
                         obj.shutdown()
                     elif hasattr(obj, 'close'):
                         obj.close()
+                except AttributeError as e:
+                    logger.warning(f"Component {comp} not found during cleanup: {e}")
+                except (OSError, IOError) as e:
+                    logger.warning(f"I/O error cleaning up {comp}: {e}")
                 except Exception as e:
-                    logger.warning(f"Error cleaning up {comp}: {e}")
+                    logger.warning(f"Unexpected error cleaning up {comp}: {e}", exc_info=True)
                     
     def _register_health_checks(self):
         """Register component health checks"""
@@ -167,7 +171,10 @@ class ParallelProcessor:
                 test_key = "__health_check__"
                 self.cache.get_cached_metadata(test_key, "test_hash")
                 return True
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
             except Exception:
+                logger.debug("Unexpected error in health check", exc_info=True)
                 return False
                 
         # Metadata store health check
@@ -176,7 +183,10 @@ class ParallelProcessor:
                 # Test metadata query
                 self.metadata_store.query({})
                 return True
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
             except Exception:
+                logger.debug("Unexpected error in health check", exc_info=True)
                 return False
                 
         self.health_checker.register_component("cache", check_cache_health)
@@ -207,8 +217,10 @@ class ParallelProcessor:
         for executor in list(self._executors):
             try:
                 executor.shutdown(wait=True)
+            except RuntimeError as e:
+                logger.error(f"Runtime error shutting down executor: {e}")
             except Exception as e:
-                logger.error(f"Error shutting down executor: {e}")
+                logger.error(f"Unexpected error shutting down executor: {e}", exc_info=True)
         
     async def process_files_parallel(self, 
                                    file_paths: List[Path],
@@ -256,8 +268,13 @@ class ParallelProcessor:
                     for result in results:
                         if result:
                             await result_queue.put(result)
+                except asyncio.CancelledError:
+                    logger.info("Worker task cancelled")
+                    raise
+                except asyncio.TimeoutError as e:
+                    logger.error(f"Worker timeout processing batch: {e}")
                 except Exception as e:
-                    logger.error(f"Error in worker: {e}")
+                    logger.error(f"Unexpected error in worker: {e}", exc_info=True)
                     # Continue processing other batches
             
             # Signal completion
@@ -317,9 +334,31 @@ class ParallelProcessor:
                     try:
                         metadata = parser.parse(content, str(file_path))
                         results.append(metadata)
+                    except SyntaxError as parse_error:
+                        # Log syntax error but create minimal metadata
+                        logger.error(f"Syntax error parsing {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        results.append(metadata)
+                    except ValueError as parse_error:
+                        # Log value error but create minimal metadata
+                        logger.error(f"Value error parsing {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        results.append(metadata)
                     except Exception as parse_error:
-                        # Log parsing error but create minimal metadata
-                        logger.error(f"Parse error for {file_path}: {parse_error}")
+                        # Log unexpected parsing error but create minimal metadata
+                        logger.error(f"Unexpected parse error for {file_path}: {parse_error}", exc_info=True)
                         metadata = FileMetadata(
                             path=str(file_path),
                             size=len(content),
@@ -335,8 +374,12 @@ class ParallelProcessor:
                 logger.warning(f"Permission denied: {file_path}")
             except NonRetryableError as e:
                 logger.error(f"Non-retryable error for {file_path}: {e}")
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error processing {file_path}: {e}")
+            except MemoryError as e:
+                logger.error(f"Memory error processing {file_path}: {e}")
             except Exception as e:
-                logger.error(f"Failed to process {file_path} after retries: {e}")
+                logger.error(f"Unexpected error processing {file_path} after retries: {e}", exc_info=True)
         
         return results
     
@@ -425,7 +468,10 @@ class StreamingCompressor:
                 window = bytes(self.buffer[:self.window_size])
                 
                 # Deduplicate using content hash
+                # Use mmh3 for performance, not security
                 content_hash = mmh3.hash128(window)
+                # For security-sensitive operations, use SHA-256:
+                # content_hash = hashlib.sha256(window).hexdigest()
                 if content_hash not in self.seen_hashes:
                     # Implement LRU cache behavior to prevent unbounded growth
                     if len(self.seen_hashes) >= self.max_hashes:
@@ -709,8 +755,16 @@ class MetadataStore:
                 }, f)
             # Atomic rename
             temp_file.replace(metadata_file)
+        except (OSError, IOError) as e:
+            logger.error(f"I/O error saving metadata store: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+        except pickle.PicklingError as e:
+            logger.error(f"Pickling error saving metadata store: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
         except Exception as e:
-            logger.error(f"Failed to save metadata store: {e}")
+            logger.error(f"Unexpected error saving metadata store: {e}", exc_info=True)
             if temp_file.exists():
                 temp_file.unlink()
     
@@ -1013,7 +1067,7 @@ class SelectiveCompressor:
             'summary': {
                 'language': metadata['language'],
                 'size': metadata['size'],
-                'complexity': metadata['complexity'],
+                'complexity': metadata.get('complexity_score', metadata.get('complexity', 0)),
                 'imports_count': len(metadata['imports']),
                 'exports_count': len(metadata['exports']),
                 'functions_count': len(metadata['functions']),
@@ -1035,8 +1089,14 @@ class SelectiveCompressor:
         except PermissionError:
             logger.error(f"Permission denied reading file: {path}")
             return ""
+        except UnicodeDecodeError as e:
+            logger.error(f"Encoding error loading file {path}: {e}")
+            return ""
+        except MemoryError as e:
+            logger.error(f"Memory error loading file {path}: {e}")
+            return ""
         except Exception as e:
-            logger.error(f"Error loading file {path}: {e}")
+            logger.error(f"Unexpected error loading file {path}: {e}", exc_info=True)
             return ""
     
     def _load_and_minify(self, path: str) -> str:
@@ -1592,8 +1652,14 @@ class CodebaseCompressionPipeline:
             
         try:
             create_directories()
+        except PermissionError as e:
+            logger.error(f"Permission denied creating directories: {e}")
+            raise
+        except OSError as e:
+            logger.error(f"OS error creating directories: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Failed to create directories after retries: {e}")
+            logger.error(f"Unexpected error creating directories after retries: {e}", exc_info=True)
             raise
         
         # Initialize resilience components
@@ -1615,8 +1681,14 @@ class CodebaseCompressionPipeline:
                 try:
                     self.cache = HybridCache(cache_dir, redis_config)
                     logger.info("Using hybrid cache with Redis support")
+                except ImportError as e:
+                    logger.warning(f"Redis module not available: {e}")
+                    logger.info("Falling back to local cache only")
+                except ConnectionError as e:
+                    logger.warning(f"Failed to connect to Redis: {e}")
+                    logger.info("Falling back to local cache only")
                 except Exception as e:
-                    logger.warning(f"Failed to initialize Redis cache: {e}")
+                    logger.warning(f"Unexpected error initializing Redis cache: {e}", exc_info=True)
                     logger.info("Falling back to local cache only")
                     self.cache = IncrementalCache(cache_dir)
             else:
@@ -1630,8 +1702,14 @@ class CodebaseCompressionPipeline:
             self.selective_compressor = SelectiveCompressor(self.metadata_store)
             self.formatter = OutputFormatter()
             self.optimizer = PerformanceOptimizer()
+        except ImportError as e:
+            logger.error(f"Import error initializing pipeline components: {e}")
+            # Clean up partial initialization
+        except AttributeError as e:
+            logger.error(f"Attribute error initializing pipeline components: {e}")
+            # Clean up partial initialization
         except Exception as e:
-            logger.error(f"Failed to initialize pipeline components: {e}")
+            logger.error(f"Unexpected error initializing pipeline components: {e}", exc_info=True)
             # Clean up partial initialization
             self._cleanup_partial_init()
             raise
@@ -1647,8 +1725,10 @@ class CodebaseCompressionPipeline:
             try:
                 self.parsers['typescript'] = TypeScriptParser()
                 logger.info("TypeScript parser initialized successfully")
+            except ImportError as e:
+                logger.warning(f"TypeScript parser module not available: {e}")
             except Exception as e:
-                logger.warning(f"Could not initialize TypeScript parser: {e}")
+                logger.warning(f"Unexpected error initializing TypeScript parser: {e}", exc_info=True)
         else:
             # Fall back to JavaScript parser for TypeScript files
             self.parsers['typescript'] = EnhancedJavaScriptParser()
@@ -1658,16 +1738,20 @@ class CodebaseCompressionPipeline:
             try:
                 self.parsers['go'] = GoParser()
                 logger.info("Go parser initialized successfully")
+            except ImportError as e:
+                logger.warning(f"Go parser module not available: {e}")
             except Exception as e:
-                logger.warning(f"Could not initialize Go parser: {e}")
+                logger.warning(f"Unexpected error initializing Go parser: {e}", exc_info=True)
                 
         # Add Rust parser if available
         if RUST_PARSER_AVAILABLE:
             try:
                 self.parsers['rust'] = RustParser()
                 logger.info("Rust parser initialized successfully")
+            except ImportError as e:
+                logger.warning(f"Rust parser module not available: {e}")
             except Exception as e:
-                logger.warning(f"Could not initialize Rust parser: {e}")
+                logger.warning(f"Unexpected error initializing Rust parser: {e}", exc_info=True)
         
         # Register health checks if resilience enabled
         if enable_resilience:
@@ -1684,8 +1768,12 @@ class CodebaseCompressionPipeline:
                         obj.shutdown()
                     elif hasattr(obj, 'close'):
                         obj.close()
+                except AttributeError as e:
+                    logger.warning(f"Component {comp} not found during cleanup: {e}")
+                except (OSError, IOError) as e:
+                    logger.warning(f"I/O error cleaning up {comp}: {e}")
                 except Exception as e:
-                    logger.warning(f"Error cleaning up {comp}: {e}")
+                    logger.warning(f"Unexpected error cleaning up {comp}: {e}", exc_info=True)
                     
     def _register_health_checks(self):
         """Register component health checks"""
@@ -1696,7 +1784,10 @@ class CodebaseCompressionPipeline:
                 test_key = "__health_check__"
                 self.cache.get_cached_metadata(test_key, "test_hash")
                 return True
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
             except Exception:
+                logger.debug("Unexpected error in health check", exc_info=True)
                 return False
                 
         # Metadata store health check
@@ -1705,7 +1796,10 @@ class CodebaseCompressionPipeline:
                 # Test metadata query
                 self.metadata_store.query({})
                 return True
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
             except Exception:
+                logger.debug("Unexpected error in health check", exc_info=True)
                 return False
                 
         self.health_checker.register_component("cache", check_cache_health)
@@ -1781,8 +1875,12 @@ class CodebaseCompressionPipeline:
             
             return result
             
+        except asyncio.CancelledError:
+            logger.info("Pipeline processing cancelled")
+            await self.stop_health_monitoring()
+            raise
         except Exception as e:
-            logger.error(f"All resilience measures failed: {e}")
+            logger.error(f"All resilience measures failed: {e}", exc_info=True)
             await self.stop_health_monitoring()
             raise
     
@@ -1794,9 +1892,9 @@ class CodebaseCompressionPipeline:
             # Stop health monitoring synchronously
             try:
                 asyncio.create_task(self.stop_health_monitoring())
-            except RuntimeError:
-                # No event loop running
-                pass
+            except RuntimeError as e:
+                # No event loop running - this is expected during shutdown
+                logger.debug(f"Could not create task during shutdown: {e}")
         return False
     
     
@@ -1896,8 +1994,14 @@ class CodebaseCompressionPipeline:
                 
             return True
             
+        except ValueError as e:
+            logger.error(f"Invalid path value for {file_path}: {e}")
+            return False
+        except OSError as e:
+            logger.error(f"OS error validating path {file_path}: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Path validation error for {file_path}: {e}")
+            logger.error(f"Unexpected path validation error for {file_path}: {e}", exc_info=True)
             return False
     
     async def process_codebase(self, 
@@ -1907,6 +2011,16 @@ class CodebaseCompressionPipeline:
                              query_filter: Optional[Dict[str, Any]] = None,
                              ignore_patterns: Optional[List[str]] = None) -> List[Path]:
         """Process entire codebase through the pipeline"""
+        
+        # Check rate limiting
+        if not self.security_validator.rate_limiter.allow_request():
+            logger.error("Rate limit exceeded")
+            raise ValueError("Rate limit exceeded. Please try again later.")
+        
+        # Monitor resources at start
+        initial_resources = self.security_validator.check_resource_usage()
+        logger.info(f"Initial resource usage: CPU={initial_resources.get('cpu_percent', 0):.1f}%, "
+                   f"Memory={initial_resources.get('memory_percent', 0):.1f}%")
         
         # Stage 1: Discovery
         logger.info("Stage 1: Discovering files...")
@@ -1928,11 +2042,29 @@ class CodebaseCompressionPipeline:
                       for allowed in self.security_config.allowed_base_paths):
                 raise ValueError(f"Codebase path not in allowed directories: {codebase_path}")
                 
+        except ValueError as e:
+            logger.error(f"Invalid codebase path value: {e}")
+            return []
+        except OSError as e:
+            logger.error(f"OS error with codebase path: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Invalid codebase path: {e}")
+            logger.error(f"Unexpected error with codebase path: {e}", exc_info=True)
             return []
         
-        file_paths = list(codebase_path.rglob('*'))
+        # Secure file discovery - filter hidden and sensitive files
+        file_paths = []
+        for path in codebase_path.rglob('*'):
+            # Skip hidden files and directories unless explicitly allowed
+            if any(part.startswith('.') for part in path.parts):
+                # Skip sensitive hidden directories
+                if any(part in {'.git', '.env', '.aws', '.ssh', '.gnupg'} for part in path.parts):
+                    logger.debug(f"Skipping sensitive directory: {path}")
+                    continue
+                    
+            # Only include regular files
+            if path.is_file():
+                file_paths.append(path)
         
         # Apply security limits
         if len(file_paths) > self.security_config.max_total_files:
@@ -1955,8 +2087,10 @@ class CodebaseCompressionPipeline:
                             continue
                         total_size += file_size
                         validated_paths.append(f)
-                    except Exception as e:
+                    except OSError as e:
                         logger.warning(f"Could not stat file {f}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Unexpected error getting file stats for {f}: {e}", exc_info=True)
                 else:
                     logger.warning(f"Skipping invalid path: {f}")
                     
@@ -2013,6 +2147,14 @@ class CodebaseCompressionPipeline:
         # Stage 2: Incremental check
         logger.info("Stage 2: Checking cache for changes...")
         
+        # Check resources before heavy processing
+        current_resources = self.security_validator.check_resource_usage()
+        if current_resources.get('memory_percent', 0) > 80:
+            logger.warning(f"High memory usage: {current_resources.get('memory_percent', 0):.1f}%")
+            # Consider reducing batch size
+            self.batch_size = max(10, self.batch_size // 2)
+            logger.info(f"Reduced batch size to {self.batch_size} due to high memory usage")
+        
         if TQDM_AVAILABLE and file_paths:
             # Create progress bar for hashing files
             current_files = {}
@@ -2025,8 +2167,10 @@ class CodebaseCompressionPipeline:
                             while chunk := file.read(8192):
                                 hasher.update(chunk)
                         current_files[str(f)] = hasher.hexdigest()
+                    except (OSError, IOError) as e:
+                        logger.warning(f"I/O error reading {f}: {e}")
                     except Exception as e:
-                        logger.warning(f"Could not read {f}: {e}")
+                        logger.warning(f"Unexpected error reading {f}: {e}", exc_info=True)
                     pbar.update(1)
         else:
             current_files = {}
@@ -2038,8 +2182,10 @@ class CodebaseCompressionPipeline:
                         while chunk := file.read(8192):
                             hasher.update(chunk)
                     current_files[str(f)] = hasher.hexdigest()
+                except (OSError, IOError) as e:
+                    logger.warning(f"I/O error reading {f}: {e}")
                 except Exception as e:
-                    logger.warning(f"Could not read {f}: {e}")
+                    logger.warning(f"Unexpected error reading {f}: {e}", exc_info=True)
         added, modified, deleted = self.cache.get_changed_files(current_files)
         
         files_to_process = [Path(f) for f in added | modified]
@@ -2137,8 +2283,10 @@ class CodebaseCompressionPipeline:
                     compressed = compress_func(metadata_dict)
                     if compressed:
                         compressed_data.append(compressed)
+                except AttributeError as e:
+                    logger.warning(f"Invalid metadata structure for compression: {e}")
                 except Exception as e:
-                    logger.warning(f"Failed to compress {getattr(metadata, 'path', metadata.get('path', 'unknown'))}: {e}")
+                    logger.warning(f"Unexpected error compressing {getattr(metadata, 'path', metadata.get('path', 'unknown'))}: {e}", exc_info=True)
         
         logger.info(f"Compressed {len(compressed_data)} files")
         

@@ -46,8 +46,12 @@ class ParallelProcessor:
                         obj.shutdown()
                     elif hasattr(obj, 'close'):
                         obj.close()
+                except AttributeError as e:
+                    logger.warning(f"Component {comp} not found during cleanup: {e}")
+                except (OSError, IOError) as e:
+                    logger.warning(f"I/O error cleaning up {comp}: {e}")
                 except Exception as e:
-                    logger.warning(f"Error cleaning up {comp}: {e}")
+                    logger.warning(f"Unexpected error cleaning up {comp}: {e}", exc_info=True)
                     
     def _register_health_checks(self):
         """Register component health checks"""
@@ -58,7 +62,10 @@ class ParallelProcessor:
                 test_key = "__health_check__"
                 self.cache.get_cached_metadata(test_key, "test_hash")
                 return True
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
             except Exception:
+                logger.debug("Unexpected error in health check", exc_info=True)
                 return False
                 
         # Metadata store health check
@@ -67,7 +74,10 @@ class ParallelProcessor:
                 # Test metadata query
                 self.metadata_store.query({})
                 return True
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
             except Exception:
+                logger.debug("Unexpected error in health check", exc_info=True)
                 return False
                 
         self.health_checker.register_component("cache", check_cache_health)
@@ -98,8 +108,10 @@ class ParallelProcessor:
         for executor in list(self._executors):
             try:
                 executor.shutdown(wait=True)
+            except RuntimeError as e:
+                logger.error(f"Runtime error shutting down executor: {e}")
             except Exception as e:
-                logger.error(f"Error shutting down executor: {e}")
+                logger.error(f"Unexpected error shutting down executor: {e}", exc_info=True)
         
     async def process_files_parallel(self, 
                                    file_paths: List[Path],
@@ -147,8 +159,13 @@ class ParallelProcessor:
                     for result in results:
                         if result:
                             await result_queue.put(result)
+                except asyncio.CancelledError:
+                    logger.info("Worker task cancelled")
+                    raise
+                except asyncio.TimeoutError as e:
+                    logger.error(f"Worker timeout processing batch: {e}")
                 except Exception as e:
-                    logger.error(f"Error in worker: {e}")
+                    logger.error(f"Unexpected error in worker: {e}", exc_info=True)
                     # Continue processing other batches
             
             # Signal completion
@@ -208,9 +225,31 @@ class ParallelProcessor:
                     try:
                         metadata = parser.parse(content, str(file_path))
                         results.append(metadata)
+                    except SyntaxError as parse_error:
+                        # Log syntax error but create minimal metadata
+                        logger.error(f"Syntax error parsing {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        results.append(metadata)
+                    except ValueError as parse_error:
+                        # Log value error but create minimal metadata
+                        logger.error(f"Value error parsing {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        results.append(metadata)
                     except Exception as parse_error:
-                        # Log parsing error but create minimal metadata
-                        logger.error(f"Parse error for {file_path}: {parse_error}")
+                        # Log unexpected parsing error but create minimal metadata
+                        logger.error(f"Unexpected parse error for {file_path}: {parse_error}", exc_info=True)
                         metadata = FileMetadata(
                             path=str(file_path),
                             size=len(content),
@@ -226,8 +265,12 @@ class ParallelProcessor:
                 logger.warning(f"Permission denied: {file_path}")
             except NonRetryableError as e:
                 logger.error(f"Non-retryable error for {file_path}: {e}")
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error processing {file_path}: {e}")
+            except MemoryError as e:
+                logger.error(f"Memory error processing {file_path}: {e}")
             except Exception as e:
-                logger.error(f"Failed to process {file_path} after retries: {e}")
+                logger.error(f"Unexpected error processing {file_path} after retries: {e}", exc_info=True)
         
         return results
     
