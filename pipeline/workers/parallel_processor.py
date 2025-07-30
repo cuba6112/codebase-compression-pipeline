@@ -12,6 +12,8 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, AsyncIterator
 
+import aiofiles
+
 from base_classes import FileMetadata, LanguageParser
 from resilience_patterns import with_retry, RetryConfig, NonRetryableError
 
@@ -96,14 +98,9 @@ class ParallelProcessor:
                 if batch is None:
                     break
                 
-                # Process batch in thread pool to avoid blocking
+                # Process batch asynchronously
                 try:
-                    results = await asyncio.get_running_loop().run_in_executor(
-                        self.thread_executor,
-                        self._process_batch,
-                        batch,
-                        parser_factory
-                    )
+                    results = await self._process_batch_async(batch, parser_factory)
                     
                     # Push results to result queue
                     for result in results:
@@ -158,9 +155,21 @@ class ParallelProcessor:
         
         @with_retry(retry_config)
         def read_file_with_retry(file_path: Path) -> str:
-            """Read file with retry logic for transient errors."""
+            """Read file with retry logic for transient errors (synchronous fallback)."""
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
+        
+        async def read_file_async_with_retry(file_path: Path) -> str:
+            """Async read file with retry logic for transient errors."""
+            for attempt in range(retry_config.max_attempts):
+                try:
+                    async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        return await f.read()
+                except (IOError, OSError) as e:
+                    if attempt < retry_config.max_attempts - 1:
+                        await asyncio.sleep(retry_config.initial_delay * (2 ** attempt))
+                        continue
+                    raise
         
         for file_path in batch:
             try:
@@ -200,6 +209,102 @@ class ParallelProcessor:
                 logger.error(f"Non-retryable error for {file_path}: {e}")
             except Exception as e:
                 logger.error(f"Failed to process {file_path} after retries: {e}")
+        
+        return results
+    
+    async def _process_batch_async(self, 
+                                  batch: List[Path], 
+                                  parser_factory: Dict[str, LanguageParser]) -> List[FileMetadata]:
+        """
+        Process a batch of files asynchronously with resilience patterns.
+        
+        Args:
+            batch: List of file paths to process
+            parser_factory: Dictionary mapping language to parser instances
+            
+        Returns:
+            List of FileMetadata objects for successfully processed files
+        """
+        results = []
+        
+        # Configure retry for file operations
+        retry_config = RetryConfig(
+            max_attempts=3,
+            initial_delay=0.5,
+            retryable_exceptions=(IOError, OSError)
+        )
+        
+        async def read_file_async_with_retry(file_path: Path) -> str:
+            """Async read file with retry logic for transient errors."""
+            for attempt in range(retry_config.max_attempts):
+                try:
+                    async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        return await f.read()
+                except (IOError, OSError) as e:
+                    if attempt < retry_config.max_attempts - 1:
+                        await asyncio.sleep(retry_config.initial_delay * (2 ** attempt))
+                        continue
+                    raise
+        
+        # Process files concurrently within the batch
+        async def process_single_file(file_path: Path) -> Optional[FileMetadata]:
+            """Process a single file asynchronously."""
+            try:
+                # Read file with async retry mechanism
+                content = await read_file_async_with_retry(file_path)
+                
+                # Determine language from file extension
+                suffix = file_path.suffix.lower()
+                language = self._detect_language(suffix)
+                
+                if language in parser_factory:
+                    parser = parser_factory[language]
+                    
+                    # Parse with error recovery
+                    try:
+                        # Note: Parser.parse is typically synchronous, run in executor if needed
+                        metadata = await asyncio.get_running_loop().run_in_executor(
+                            None, parser.parse, content, str(file_path)
+                        )
+                        return metadata
+                    except Exception as parse_error:
+                        # Log parsing error but create minimal metadata
+                        logger.error(f"Parse error for {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        return metadata
+                else:
+                    logger.debug(f"No parser available for language: {language}")
+                    return None
+                    
+            except FileNotFoundError:
+                logger.warning(f"File not found: {file_path}")
+                return None
+            except PermissionError:
+                logger.warning(f"Permission denied: {file_path}")
+                return None
+            except NonRetryableError as e:
+                logger.error(f"Non-retryable error for {file_path}: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Failed to process {file_path} after retries: {e}")
+                return None
+        
+        # Process all files in the batch concurrently
+        tasks = [process_single_file(file_path) for file_path in batch]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Filter out None results and exceptions
+        for result in batch_results:
+            if isinstance(result, FileMetadata):
+                results.append(result)
+            elif isinstance(result, Exception):
+                logger.error(f"Exception in batch processing: {result}")
         
         return results
     
