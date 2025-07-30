@@ -17,9 +17,20 @@ from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
-import numpy as np
 from collections import Counter
 import time
+
+# Optional numpy import with fallback
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    # NumPy is not currently used in this module, but could be leveraged for:
+    # - Advanced statistical analysis of compression patterns
+    # - Vectorized operations for large-scale data processing
+    # - Machine learning-based compression strategy selection
+    # If you need these features, install numpy with: pip install numpy
 
 try:
     import zstandard as zstd
@@ -38,6 +49,22 @@ except ImportError:
 from base_classes import FileMetadata
 
 logger = logging.getLogger(__name__)
+
+# Log numpy availability at module initialization
+if not HAS_NUMPY:
+    logger.debug("NumPy not available. Some advanced compression analysis features will use fallback implementations.")
+
+# Note: NumPy is imported but not currently used in this implementation.
+# The HAS_NUMPY flag is available for future enhancements that might benefit from:
+# - np.percentile() for better statistical analysis of byte distributions
+# - np.histogram() for efficient frequency analysis
+# - np.corrcoef() for pattern correlation detection
+# - np.fft for frequency domain analysis of repetitive patterns
+# Example usage pattern:
+#   if HAS_NUMPY:
+#       percentiles = np.percentile(data, [25, 50, 75])
+#   else:
+#       percentiles = calculate_percentiles_manual(data, [25, 50, 75])
 
 
 class CompressionAlgorithm(Enum):
@@ -242,6 +269,32 @@ class AdaptiveCompressionStrategy:
         if BROTLI_AVAILABLE:
             self.compressors[CompressionAlgorithm.BROTLI] = brotli
             
+    def _calculate_percentiles(self, data: List[float], percentiles: List[float]) -> List[float]:
+        """Calculate percentiles with numpy if available, otherwise use manual calculation"""
+        if HAS_NUMPY:
+            return np.percentile(data, percentiles).tolist()
+        else:
+            # Manual percentile calculation
+            sorted_data = sorted(data)
+            results = []
+            for p in percentiles:
+                index = int((p / 100) * (len(sorted_data) - 1))
+                results.append(sorted_data[index])
+            return results
+    
+    def _calculate_statistics(self, data: List[float]) -> Tuple[float, float]:
+        """Calculate mean and standard deviation with numpy fallback"""
+        if HAS_NUMPY:
+            return float(np.mean(data)), float(np.std(data))
+        else:
+            # Manual calculation
+            if not data:
+                return 0.0, 0.0
+            mean = sum(data) / len(data)
+            variance = sum((x - mean) ** 2 for x in data) / len(data)
+            std = variance ** 0.5
+            return mean, std
+    
     def analyze_content(self, content: bytes, sample_size: int = 8192) -> ContentAnalysis:
         """Analyze content characteristics"""
         analysis = ContentAnalysis()
@@ -433,8 +486,18 @@ class AdaptiveCompressionStrategy:
             elif profile.algorithm == CompressionAlgorithm.BROTLI and BROTLI_AVAILABLE:
                 compressed = brotli.compress(data, quality=profile.level)
                 
+        except MemoryError as e:
+            logger.error(f"Memory error during compression with {profile.algorithm}: {e}")
+            # Fall back to LZ4 with lower compression
+            compressed = lz4.frame.compress(data, compression_level=1)
+            stats["algorithm"] = "lz4 (fallback)"
+        except ValueError as e:
+            logger.error(f"Invalid compression parameters for {profile.algorithm}: {e}")
+            # Fall back to LZ4
+            compressed = lz4.frame.compress(data, compression_level=1)
+            stats["algorithm"] = "lz4 (fallback)"
         except Exception as e:
-            logger.error(f"Compression failed with {profile.algorithm}: {e}")
+            logger.error(f"Unexpected compression error with {profile.algorithm}: {e}", exc_info=True)
             # Fall back to LZ4
             compressed = lz4.frame.compress(data, compression_level=1)
             stats["algorithm"] = "lz4 (fallback)"
@@ -471,8 +534,14 @@ class AdaptiveCompressionStrategy:
             elif algorithm == CompressionAlgorithm.BROTLI and BROTLI_AVAILABLE:
                 return brotli.decompress(data)
                 
+        except ValueError as e:
+            logger.error(f"Invalid compressed data for {algorithm}: {e}")
+            raise
+        except MemoryError as e:
+            logger.error(f"Memory error during decompression: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Decompression failed: {e}")
+            logger.error(f"Unexpected decompression error: {e}", exc_info=True)
             raise
             
         return data
@@ -589,8 +658,12 @@ class AdaptiveCompressionManager:
             try:
                 with open(self.stats_file, 'r') as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON in compression statistics file {self.stats_file}: {e}")
+            except (OSError, IOError) as e:
+                logger.warning(f"I/O error loading compression statistics from {self.stats_file}: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error loading compression statistics from {self.stats_file}: {e}", exc_info=True)
         return {
             "total_files": 0,
             "total_original_size": 0,
@@ -605,8 +678,10 @@ class AdaptiveCompressionManager:
             self.stats_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.stats_file, 'w') as f:
                 json.dump(self.stats, f, indent=2)
+        except (OSError, IOError) as e:
+            logger.error(f"I/O error saving compression stats: {e}")
         except Exception as e:
-            logger.error(f"Failed to save compression stats: {e}")
+            logger.error(f"Unexpected error saving compression stats: {e}", exc_info=True)
             
     def compress_file(
         self,

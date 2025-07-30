@@ -266,8 +266,12 @@ class AdaptiveConfig:
                         total_size += f.stat().st_size
                     except (OSError, PermissionError) as e:
                         logger.warning(f"Cannot access file {f}: {e}")
+        except ValueError as e:
+            logger.error(f"Invalid path value analyzing codebase: {e}")
+            file_count = 1  # Fallback
+            total_size = 1024  # Fallback
         except Exception as e:
-            logger.error(f"Error analyzing codebase: {e}")
+            logger.error(f"Unexpected error analyzing codebase: {e}", exc_info=True)
             file_count = 1  # Fallback
             total_size = 1024  # Fallback
         
@@ -392,8 +396,10 @@ class PerformanceTuning:
             import ast
             try:
                 ast.parse("def foo(): pass")
+            except SyntaxError as e:
+                logger.error(f"Syntax error in benchmark parsing: {e}")
             except Exception as e:
-                logger.error(f"Error in benchmark parsing: {e}")
+                logger.error(f"Unexpected error in benchmark parsing: {e}", exc_info=True)
         metrics['parsing_speed_files_per_sec'] = 10 / (time.time() - start)
         
         # Estimate memory usage

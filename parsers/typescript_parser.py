@@ -214,8 +214,8 @@ class TypeScriptParser(LanguageParser):
                 # Clean up temp file
                 try:
                     os.unlink(tmp_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Could not delete temporary file {tmp_path}: {e}")
                     
         except subprocess.TimeoutExpired:
             logger.error(f"TypeScript parser timeout for {filepath}")
@@ -283,8 +283,8 @@ class TypeScriptParser(LanguageParser):
         finally:
             try:
                 os.unlink(tmp_path)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not delete temporary file {tmp_path}: {e}")
                 
         return {}
         

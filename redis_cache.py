@@ -178,8 +178,15 @@ class RedisDistributedCache:
                 return self._deserialize_metadata(data)
             return None
             
+        except redis.ConnectionError as e:
+            logger.error(f"Redis connection error getting key {key}: {e}")
+            self._connected = False
+            return None
+        except redis.TimeoutError as e:
+            logger.error(f"Redis timeout getting key {key}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Redis get error for key {key}: {e}")
+            logger.error(f"Unexpected Redis error getting key {key}: {e}", exc_info=True)
             return None
             
     async def get_async(self, key: str) -> Optional[FileMetadata]:
@@ -196,8 +203,15 @@ class RedisDistributedCache:
                 return self._deserialize_metadata(data)
             return None
             
+        except redis.ConnectionError as e:
+            logger.error(f"Redis async connection error getting key {key}: {e}")
+            self._connected = False
+            return None
+        except asyncio.TimeoutError as e:
+            logger.error(f"Redis async timeout getting key {key}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Redis async get error for key {key}: {e}")
+            logger.error(f"Unexpected Redis async error getting key {key}: {e}", exc_info=True)
             return None
             
     def set(self, key: str, value: FileMetadata, ttl: Optional[int] = None) -> bool:
@@ -218,8 +232,18 @@ class RedisDistributedCache:
             ttl = ttl or self.config.ttl_seconds
             return self.client.setex(redis_key, ttl, serialized)
             
+        except redis.ConnectionError as e:
+            logger.error(f"Redis connection error setting key {key}: {e}")
+            self._connected = False
+            return False
+        except redis.TimeoutError as e:
+            logger.error(f"Redis timeout setting key {key}: {e}")
+            return False
+        except pickle.PicklingError as e:
+            logger.error(f"Serialization error setting key {key}: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Redis set error for key {key}: {e}")
+            logger.error(f"Unexpected Redis error setting key {key}: {e}", exc_info=True)
             return False
             
     async def set_async(self, key: str, value: FileMetadata, ttl: Optional[int] = None) -> bool:
@@ -241,8 +265,18 @@ class RedisDistributedCache:
             ttl = ttl or self.config.ttl_seconds
             return await self.async_client.setex(redis_key, ttl, serialized)
             
+        except redis.ConnectionError as e:
+            logger.error(f"Redis async connection error setting key {key}: {e}")
+            self._connected = False
+            return False
+        except asyncio.TimeoutError as e:
+            logger.error(f"Redis async timeout setting key {key}: {e}")
+            return False
+        except pickle.PicklingError as e:
+            logger.error(f"Serialization error setting key {key}: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Redis async set error for key {key}: {e}")
+            logger.error(f"Unexpected Redis async error setting key {key}: {e}", exc_info=True)
             return False
             
     def delete(self, key: str) -> bool:

@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
 import pickle
+import io
+import hashlib
 import hashlib
 
 logger = logging.getLogger(__name__)
@@ -64,8 +66,10 @@ class FileLock:
             try:
                 self.lockfile.unlink()
                 self.lock_acquired = False
+            except OSError as e:
+                logger.warning(f"OS error releasing lock: {e}")
             except Exception as e:
-                logger.warning(f"Error releasing lock: {e}")
+                logger.warning(f"Unexpected error releasing lock: {e}", exc_info=True)
                 
     def _is_stale_lock(self) -> bool:
         """Check if lock file is stale (older than timeout)"""
@@ -73,8 +77,10 @@ class FileLock:
             if self.lockfile.exists():
                 mtime = self.lockfile.stat().st_mtime
                 return time.time() - mtime > self.timeout
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not check lock file stats: {e}")
+        except Exception as e:
+            logger.debug(f"Unexpected error checking lock file stats: {e}", exc_info=True)
         return False
         
     def _remove_stale_lock(self):
@@ -82,8 +88,10 @@ class FileLock:
         try:
             self.lockfile.unlink()
             logger.info(f"Removed stale lock file: {self.lockfile}")
-        except Exception as e:
+        except OSError as e:
             logger.warning(f"Could not remove stale lock: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error removing stale lock: {e}", exc_info=True)
             
     def __enter__(self):
         if not self.acquire():
@@ -126,6 +134,17 @@ class EnhancedIncrementalCache:
                     self._backup_corrupted_index()
         return {}
         
+    def _convert_metadata_to_json(self, metadata: Any) -> Dict[str, Any]:
+        """Convert metadata to JSON-serializable format"""
+        # This is a simple conversion - extend based on your metadata structure
+        if isinstance(metadata, dict):
+            return {k: str(v) if not isinstance(v, (str, int, float, bool, list, dict, type(None))) else v 
+                   for k, v in metadata.items()}
+        elif hasattr(metadata, '__dict__'):
+            return self._convert_metadata_to_json(metadata.__dict__)
+        else:
+            return {'data': str(metadata)}
+    
     def _save_index_safe(self):
         """Save cache index with proper locking"""
         temp_file = self.index_file.with_suffix('.tmp')
@@ -139,8 +158,18 @@ class EnhancedIncrementalCache:
                 # Atomic rename
                 temp_file.replace(self.index_file)
                 
+            except (OSError, IOError) as e:
+                logger.error(f"I/O error saving cache index: {e}")
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON error saving cache index: {e}")
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
             except Exception as e:
-                logger.error(f"Failed to save cache index: {e}")
+                logger.error(f"Unexpected error saving cache index: {e}", exc_info=True)
                 if temp_file.exists():
                     temp_file.unlink()
                 raise
@@ -153,8 +182,10 @@ class EnhancedIncrementalCache:
             try:
                 self.index_file.rename(backup_file)
                 logger.info(f"Backed up corrupted index to: {backup_file}")
+            except OSError as e:
+                logger.error(f"OS error backing up corrupted index: {e}")
             except Exception as e:
-                logger.error(f"Could not backup corrupted index: {e}")
+                logger.error(f"Unexpected error backing up corrupted index: {e}", exc_info=True)
                 
     def get_cached_metadata(self, file_path: str, content_hash: str) -> Optional[Any]:
         """Thread-safe retrieval of cached metadata"""
@@ -169,10 +200,25 @@ class EnhancedIncrementalCache:
                     cache_file = self.cache_dir / entry['cache_file']
                     if cache_file.exists():
                         try:
-                            with open(cache_file, 'rb') as f:
-                                return pickle.load(f)
+                            # Try to load as JSON first (newer format)
+                            json_file = cache_file.with_suffix('.json')
+                            if json_file.exists():
+                                with open(json_file, 'r') as f:
+                                    return json.load(f)
+                            
+                            # Fall back to pickle for backward compatibility
+                            # Use secure pickle loading
+                            if cache_file.exists():
+                                from security_validation import SecureProcessor
+                                return SecureProcessor.safe_pickle_load(cache_file)
+                            
+                            return None
+                        except (OSError, IOError) as e:
+                            logger.warning(f"I/O error loading cached data: {e}")
+                        except pickle.UnpicklingError as e:
+                            logger.warning(f"Unpickling error loading cached data: {e}")
                         except Exception as e:
-                            logger.warning(f"Failed to load cached data: {e}")
+                            logger.warning(f"Unexpected error loading cached data: {e}", exc_info=True)
                             
         return None
         
@@ -190,13 +236,27 @@ class EnhancedIncrementalCache:
                 cache_file = self.cache_dir / cache_filename
                 
                 # Save metadata to disk
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Use JSON for new cache entries (security)
+                json_file = cache_file.with_suffix('.json')
                 
-                # Update index
+                # Convert metadata to JSON-serializable format
+                json_metadata = self._convert_metadata_to_json(metadata)
+                
+                # Write atomically
+                temp_file = json_file.with_suffix('.tmp')
+                try:
+                    with open(temp_file, 'w') as f:
+                        json.dump(json_metadata, f, indent=2)
+                    temp_file.replace(json_file)
+                    cache_file = json_file  # Update reference for size calculation
+                except Exception:
+                    temp_file.unlink(missing_ok=True)
+                    raise
+                
+                # Update index with JSON file reference
                 self.index[file_path] = {
                     'content_hash': content_hash,
-                    'cache_file': cache_filename,
+                    'cache_file': cache_filename.replace('.pkl', '.json'),
                     'timestamp': time.time(),
                     'size': os.path.getsize(cache_file)
                 }
@@ -205,8 +265,14 @@ class EnhancedIncrementalCache:
                 self._save_index_safe()
                 return True
                 
+            except (OSError, IOError) as e:
+                logger.error(f"I/O error updating cache for {file_path}: {e}")
+                return False
+            except pickle.PicklingError as e:
+                logger.error(f"Pickling error updating cache for {file_path}: {e}")
+                return False
             except Exception as e:
-                logger.error(f"Failed to update cache for {file_path}: {e}")
+                logger.error(f"Unexpected error updating cache for {file_path}: {e}", exc_info=True)
                 return False
                 
     async def update_cache_async(self, file_path: str, content_hash: str, metadata: Any) -> bool:
@@ -232,8 +298,10 @@ class EnhancedIncrementalCache:
                         if cache_file.exists():
                             try:
                                 cache_file.unlink()
+                            except OSError as e:
+                                logger.warning(f"OS error removing cache file: {e}")
                             except Exception as e:
-                                logger.warning(f"Could not remove cache file: {e}")
+                                logger.warning(f"Unexpected error removing cache file: {e}", exc_info=True)
                                 
                 # Update index
                 for file_path in expired_files:

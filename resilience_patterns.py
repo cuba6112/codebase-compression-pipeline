@@ -69,17 +69,133 @@ class CircuitBreakerState:
 
 class RetryableError(Exception):
     """Base class for retryable errors"""
-    pass
+    
+    def __init__(self, message: str, cause: Optional[Exception] = None, 
+                 retry_after: Optional[float] = None, attempt: int = 0):
+        """
+        Initialize a retryable error.
+        
+        Args:
+            message: Error description
+            cause: Original exception that caused this error
+            retry_after: Suggested delay before retry (seconds)
+            attempt: Current retry attempt number
+        """
+        super().__init__(message)
+        self.cause = cause
+        self.retry_after = retry_after
+        self.attempt = attempt
+        self.timestamp = time.time()
+        self.traceback = traceback.format_exc() if cause else None
+    
+    def __str__(self) -> str:
+        base_msg = super().__str__()
+        if self.cause:
+            return f"RetryableError: {base_msg} (caused by {type(self.cause).__name__}: {self.cause})"
+        return f"RetryableError: {base_msg}"
+    
+    def __repr__(self) -> str:
+        return (f"RetryableError(message={super().__str__()!r}, "
+                f"cause={self.cause!r}, retry_after={self.retry_after}, "
+                f"attempt={self.attempt})")
+    
+    def should_retry(self, max_attempts: int) -> bool:
+        """Check if retry should be attempted based on attempt count"""
+        return self.attempt < max_attempts
 
 
 class NonRetryableError(Exception):
     """Base class for non-retryable errors"""
-    pass
+    
+    def __init__(self, message: str, cause: Optional[Exception] = None,
+                 error_code: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        """
+        Initialize a non-retryable error.
+        
+        Args:
+            message: Error description
+            cause: Original exception that caused this error
+            error_code: Specific error code for categorization
+            details: Additional error context
+        """
+        super().__init__(message)
+        self.cause = cause
+        self.error_code = error_code
+        self.details = details or {}
+        self.timestamp = time.time()
+        self.traceback = traceback.format_exc() if cause else None
+    
+    def __str__(self) -> str:
+        base_msg = super().__str__()
+        if self.error_code:
+            base_msg = f"[{self.error_code}] {base_msg}"
+        if self.cause:
+            return f"NonRetryableError: {base_msg} (caused by {type(self.cause).__name__}: {self.cause})"
+        return f"NonRetryableError: {base_msg}"
+    
+    def __repr__(self) -> str:
+        return (f"NonRetryableError(message={super().__str__()!r}, "
+                f"cause={self.cause!r}, error_code={self.error_code!r}, "
+                f"details={self.details!r})")
+    
+    def log_context(self) -> Dict[str, Any]:
+        """Get error context for structured logging"""
+        return {
+            'error_type': 'non_retryable',
+            'error_code': self.error_code,
+            'message': str(self),
+            'timestamp': self.timestamp,
+            'details': self.details,
+            'cause': str(self.cause) if self.cause else None
+        }
 
 
 class CircuitOpenError(Exception):
     """Raised when circuit breaker is open"""
-    pass
+    
+    def __init__(self, circuit_name: str, message: Optional[str] = None,
+                 last_failure_time: Optional[float] = None,
+                 failure_count: int = 0, recovery_timeout: Optional[float] = None):
+        """
+        Initialize a circuit open error.
+        
+        Args:
+            circuit_name: Name of the circuit breaker
+            message: Optional custom message
+            last_failure_time: Timestamp of last failure
+            failure_count: Number of failures that triggered opening
+            recovery_timeout: Time until circuit attempts recovery
+        """
+        default_message = f"Circuit breaker '{circuit_name}' is OPEN"
+        super().__init__(message or default_message)
+        self.circuit_name = circuit_name
+        self.last_failure_time = last_failure_time
+        self.failure_count = failure_count
+        self.recovery_timeout = recovery_timeout
+        self.timestamp = time.time()
+    
+    def __str__(self) -> str:
+        base_msg = super().__str__()
+        if self.recovery_timeout and self.last_failure_time:
+            remaining = max(0, self.recovery_timeout - (time.time() - self.last_failure_time))
+            return f"{base_msg} (recovery in {remaining:.1f}s)"
+        return base_msg
+    
+    def __repr__(self) -> str:
+        return (f"CircuitOpenError(circuit_name={self.circuit_name!r}, "
+                f"failure_count={self.failure_count}, "
+                f"recovery_timeout={self.recovery_timeout})")
+    
+    def time_until_recovery(self) -> Optional[float]:
+        """Calculate remaining time until circuit recovery attempt"""
+        if self.recovery_timeout and self.last_failure_time:
+            return max(0, self.recovery_timeout - (time.time() - self.last_failure_time))
+        return None
+    
+    def is_recoverable(self) -> bool:
+        """Check if circuit can attempt recovery now"""
+        remaining = self.time_until_recovery()
+        return remaining is not None and remaining <= 0
 
 
 def with_retry(config: Optional[RetryConfig] = None):
@@ -329,7 +445,7 @@ class HealthChecker:
             try:
                 await self._task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Health monitoring task cancelled successfully")
                 
     async def _monitor_loop(self):
         """Main monitoring loop"""

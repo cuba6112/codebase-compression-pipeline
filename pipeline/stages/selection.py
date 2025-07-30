@@ -100,7 +100,7 @@ class SelectiveCompressor:
             'summary': {
                 'language': metadata['language'],
                 'size': metadata['size'],
-                'complexity': metadata['complexity'],
+                'complexity': metadata.get('complexity_score', metadata.get('complexity', 0)),
                 'imports_count': len(metadata['imports']),
                 'exports_count': len(metadata['exports']),
                 'functions_count': len(metadata['functions']),

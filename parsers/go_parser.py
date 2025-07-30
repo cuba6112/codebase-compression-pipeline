@@ -215,8 +215,8 @@ class GoParser(LanguageParser):
                     # Clean up temp file
                     try:
                         os.unlink(tmp_path)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not delete temporary file {tmp_path}: {e}")
                         
             except subprocess.TimeoutExpired:
                 logger.error(f"Go parser timeout for {filepath}")
@@ -337,8 +337,8 @@ class GoParser(LanguageParser):
             finally:
                 try:
                     os.unlink(tmp_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Could not delete temporary file {tmp_path}: {e}")
                     
         return {}
         
