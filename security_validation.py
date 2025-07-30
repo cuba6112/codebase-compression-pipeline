@@ -112,8 +112,19 @@ class PathValidator:
         
     def validate_path(self, path: Union[str, Path],
                      base_path: Optional[Path] = None,
-                     must_exist: bool = True) -> Optional[Path]:
-        """Validate and sanitize a file path"""
+                     must_exist: bool = True,
+                     allow_creation: bool = False) -> Optional[Path]:
+        """Validate and sanitize a file path
+        
+        Args:
+            path: Path to validate
+            base_path: Optional base path for relative validation
+            must_exist: Whether the path must already exist
+            allow_creation: Whether to allow creation of non-existing directories
+            
+        Returns:
+            Validated Path object or None if validation fails
+        """
         try:
             # Convert to Path object
             path = Path(path)
@@ -138,16 +149,18 @@ class PathValidator:
                 # Use strict resolution in Python 3.10+
                 if sys.version_info >= (3, 10):
                     try:
-                        path = path.resolve(strict=must_exist)
+                        path = path.resolve(strict=must_exist and not allow_creation)
                     except (FileNotFoundError, RuntimeError) as e:
-                        logger.error(f"Path resolution failed: {e}")
-                        if must_exist:
+                        if must_exist and not allow_creation:
+                            logger.error(f"Path resolution failed: {e}")
                             return None
-                        # Resolve without strict mode when path is expected to be created
-                        path = path.resolve()
+                        else:
+                            # Resolve without strict mode when path creation is allowed
+                            logger.info(f"Path does not exist but creation allowed: {path}")
+                            path = path.resolve()
                 else:
                     path = path.resolve()
-                    if must_exist and not path.exists():
+                    if must_exist and not allow_creation and not path.exists():
                         logger.error(f"Path does not exist: {path}")
                         return None
             
@@ -217,6 +230,55 @@ class PathValidator:
             return None
         except Exception as e:
             logger.error(f"Unexpected path validation error: {e}", exc_info=True)
+            return None
+    
+    def validate_directory_path(self, path: Union[str, Path], 
+                               create_if_missing: bool = False,
+                               base_path: Optional[Path] = None) -> Optional[Path]:
+        """Validate a directory path with creation support
+        
+        Args:
+            path: Directory path to validate
+            create_if_missing: Whether to create the directory if it doesn't exist
+            base_path: Optional base path for relative validation
+            
+        Returns:
+            Validated Path object or None if validation fails
+        """
+        # Validate the path allowing creation
+        validated_path = self.validate_path(
+            path, 
+            base_path=base_path, 
+            must_exist=False, 
+            allow_creation=True
+        )
+        
+        if not validated_path:
+            return None
+            
+        try:
+            # Check if it exists and is a directory
+            if validated_path.exists():
+                if not validated_path.is_dir():
+                    logger.error(f"Path exists but is not a directory: {validated_path}")
+                    return None
+            elif create_if_missing:
+                # Create the directory with secure permissions
+                validated_path.mkdir(parents=True, exist_ok=True, mode=0o750)
+                logger.info(f"Created directory: {validated_path}")
+            else:
+                logger.warning(f"Directory does not exist: {validated_path}")
+                
+            return validated_path
+            
+        except PermissionError as e:
+            logger.error(f"Permission denied creating directory {validated_path}: {e}")
+            return None
+        except OSError as e:
+            logger.error(f"OS error with directory {validated_path}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error with directory {validated_path}: {e}", exc_info=True)
             return None
     
     def _check_case_sensitivity(self, path: Path) -> bool:

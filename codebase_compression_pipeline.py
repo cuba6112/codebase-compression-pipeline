@@ -67,6 +67,8 @@ from security_validation import (
     SecurityConfig, SecurityValidator, PathValidator,
     FileValidator, ContentScanner, SecureProcessor
 )
+# Import token counting functionality
+from token_counter import TokenCounter, TokenStats, BatchTokenCounter
 
 # Configure logging
 logging.basicConfig(
@@ -305,14 +307,9 @@ class ParallelProcessor:
                     if batch is None:
                         break
                     
-                    # Process batch in thread pool
+                    # Process batch asynchronously
                     try:
-                        results = await asyncio.get_running_loop().run_in_executor(
-                            self.thread_executor,
-                            self._process_batch,
-                            batch,
-                            parser_factory
-                        )
+                        results = await self._process_batch_async(batch, parser_factory)
                         
                         for result in results:
                             if result:
@@ -446,6 +443,117 @@ class ParallelProcessor:
                 logger.error(f"Memory error processing {file_path}: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error processing {file_path} after retries: {e}", exc_info=True)
+        
+        return results
+    
+    async def _process_batch_async(self, 
+                                  batch: List[Path], 
+                                  parser_factory: Dict[str, LanguageParser]) -> List[FileMetadata]:
+        """Process a batch of files asynchronously with resilience patterns"""
+        results = []
+        
+        # Configure retry for file operations
+        retry_config = RetryConfig(
+            max_attempts=3,
+            initial_delay=0.5,
+            retryable_exceptions=(IOError, OSError)
+        )
+        
+        async def read_file_async_with_retry(file_path: Path) -> str:
+            """Async read file with retry logic for transient errors"""
+            for attempt in range(retry_config.max_attempts):
+                try:
+                    async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        return await f.read()
+                except (IOError, OSError) as e:
+                    if attempt < retry_config.max_attempts - 1:
+                        await asyncio.sleep(retry_config.initial_delay * (2 ** attempt))
+                        continue
+                    raise
+        
+        # Process files concurrently within the batch
+        async def process_single_file(file_path: Path) -> Optional[FileMetadata]:
+            """Process a single file asynchronously"""
+            try:
+                # Read file with async retry mechanism
+                content = await read_file_async_with_retry(file_path)
+                
+                # Determine language
+                suffix = file_path.suffix.lower()
+                language = self._detect_language(suffix)
+                
+                if language in parser_factory:
+                    parser = parser_factory[language]
+                    
+                    # Parse with error recovery - run parser in executor since it's likely synchronous
+                    try:
+                        metadata = await asyncio.get_running_loop().run_in_executor(
+                            None, parser.parse, content, str(file_path)
+                        )
+                        return metadata
+                    except SyntaxError as parse_error:
+                        logger.error(f"Syntax error parsing {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        return metadata
+                    except ValueError as parse_error:
+                        logger.error(f"Value error parsing {file_path}: {parse_error}")
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        return metadata
+                    except Exception as parse_error:
+                        logger.error(f"Unexpected parse error for {file_path}: {parse_error}", exc_info=True)
+                        metadata = FileMetadata(
+                            path=str(file_path),
+                            size=len(content),
+                            language=language,
+                            last_modified=time.time(),
+                            content_hash=hashlib.sha256(content.encode()).hexdigest()
+                        )
+                        return metadata
+                else:
+                    logger.debug(f"No parser available for language: {language}")
+                    return None
+                        
+            except FileNotFoundError:
+                logger.warning(f"File not found: {file_path}")
+                return None
+            except PermissionError:
+                logger.warning(f"Permission denied: {file_path}")
+                return None
+            except NonRetryableError as e:
+                logger.error(f"Non-retryable error for {file_path}: {e}")
+                return None
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error processing {file_path}: {e}")
+                return None
+            except MemoryError as e:
+                logger.error(f"Memory error processing {file_path}: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected error processing {file_path} after retries: {e}", exc_info=True)
+                return None
+        
+        # Process all files in the batch concurrently
+        tasks = [process_single_file(file_path) for file_path in batch]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Filter out None results and exceptions
+        for result in batch_results:
+            if isinstance(result, FileMetadata):
+                results.append(result)
+            elif isinstance(result, Exception):
+                logger.error(f"Exception in async batch processing: {result}")
         
         return results
     
@@ -1771,9 +1879,13 @@ class CodebaseCompressionPipeline:
         cache_dir = Path(os.path.abspath(cache_dir))
         output_dir = Path(os.path.abspath(output_dir))
         
-        # Validate cache and output directories
-        validated_cache = self.security_validator.path_validator.validate_path(cache_dir, must_exist=False)
-        validated_output = self.security_validator.path_validator.validate_path(output_dir, must_exist=False)
+        # Validate cache and output directories with creation support
+        validated_cache = self.security_validator.path_validator.validate_directory_path(
+            cache_dir, create_if_missing=True
+        )
+        validated_output = self.security_validator.path_validator.validate_directory_path(
+            output_dir, create_if_missing=True
+        )
         
         if not validated_cache or not validated_output:
             raise ValueError("Invalid cache or output directory paths")
@@ -1857,44 +1969,68 @@ class CodebaseCompressionPipeline:
             self._cleanup_partial_init()
             raise
         
-        # Language parsers with fallback
-        self.parsers = {
-            'python': PythonParser(),
-            'javascript': EnhancedJavaScriptParser()
-        }
-        
-        # Add TypeScript parser if available
-        if TYPESCRIPT_PARSER_AVAILABLE:
-            try:
-                self.parsers['typescript'] = TypeScriptParser()
-                logger.info("TypeScript parser initialized successfully")
-            except ImportError as e:
-                logger.warning(f"TypeScript parser module not available: {e}")
-            except Exception as e:
-                logger.warning(f"Unexpected error initializing TypeScript parser: {e}", exc_info=True)
-        else:
-            # Fall back to JavaScript parser for TypeScript files
-            self.parsers['typescript'] = EnhancedJavaScriptParser()
+        # Initialize language parsers using the new registry system
+        try:
+            from parsers.registry import get_parser_registry
+            self.parser_registry = get_parser_registry()
+            self.parsers = self.parser_registry.create_parser_factory()
             
-        # Add Go parser if available
-        if GO_PARSER_AVAILABLE:
-            try:
-                self.parsers['go'] = GoParser()
-                logger.info("Go parser initialized successfully")
-            except ImportError as e:
-                logger.warning(f"Go parser module not available: {e}")
-            except Exception as e:
-                logger.warning(f"Unexpected error initializing Go parser: {e}", exc_info=True)
+            # Log available parsers
+            parser_stats = self.parser_registry.get_parser_stats()
+            logger.info(f"Initialized {parser_stats['total_parsers']} parsers for {parser_stats['supported_languages']} languages")
+            for parser_info in parser_stats['parsers']:
+                logger.debug(f"  - {parser_info['name']} v{parser_info['version']} ({parser_info['source']}): {parser_info['extensions']}")
                 
-        # Add Rust parser if available
-        if RUST_PARSER_AVAILABLE:
-            try:
-                self.parsers['rust'] = RustParser()
-                logger.info("Rust parser initialized successfully")
-            except ImportError as e:
-                logger.warning(f"Rust parser module not available: {e}")
-            except Exception as e:
-                logger.warning(f"Unexpected error initializing Rust parser: {e}", exc_info=True)
+        except ImportError as e:
+            logger.warning(f"Parser registry not available, falling back to hardcoded parsers: {e}")
+            # Fallback to old hardcoded initialization
+            self.parsers = {
+                'python': PythonParser(),
+                'javascript': EnhancedJavaScriptParser()
+            }
+            
+            # Add TypeScript parser if available
+            if TYPESCRIPT_PARSER_AVAILABLE:
+                try:
+                    self.parsers['typescript'] = TypeScriptParser()
+                    logger.info("TypeScript parser initialized successfully")
+                except ImportError as e:
+                    logger.warning(f"TypeScript parser module not available: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error initializing TypeScript parser: {e}", exc_info=True)
+            else:
+                # Fall back to JavaScript parser for TypeScript files
+                self.parsers['typescript'] = EnhancedJavaScriptParser()
+                
+            # Add Go parser if available
+            if GO_PARSER_AVAILABLE:
+                try:
+                    self.parsers['go'] = GoParser()
+                    logger.info("Go parser initialized successfully")
+                except ImportError as e:
+                    logger.warning(f"Go parser module not available: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error initializing Go parser: {e}", exc_info=True)
+                    
+            # Add Rust parser if available
+            if RUST_PARSER_AVAILABLE:
+                try:
+                    self.parsers['rust'] = RustParser()
+                    logger.info("Rust parser initialized successfully")
+                except ImportError as e:
+                    logger.warning(f"Rust parser module not available: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error initializing Rust parser: {e}", exc_info=True)
+        
+        # Initialize token counter for compression analysis
+        try:
+            self.token_counter = TokenCounter(model_name="gpt-4o")
+            self.batch_token_counter = BatchTokenCounter(self.token_counter)
+            logger.info("Token counter initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize token counter: {e}")
+            self.token_counter = None
+            self.batch_token_counter = None
         
         # Register health checks if resilience enabled
         if enable_resilience:
@@ -2185,6 +2321,152 @@ class CodebaseCompressionPipeline:
                         # Standard library imports could be tracked separately if needed
                         pass
     
+    def _generate_token_header(self, original_stats: Optional[TokenStats], 
+                              compressed_stats: Optional[TokenStats],
+                              compression_ratio: Optional[float],
+                              output_format: str) -> str:
+        """Generate token summary header for the first output file"""
+        if output_format.lower() == 'markdown':
+            return self._generate_markdown_token_header(original_stats, compressed_stats, compression_ratio)
+        elif output_format.lower() == 'json':
+            return self._generate_json_token_header(original_stats, compressed_stats, compression_ratio)
+        elif output_format.lower() == 'xml':
+            return self._generate_xml_token_header(original_stats, compressed_stats, compression_ratio)
+        else:
+            # Default to markdown-style for unknown formats
+            return self._generate_markdown_token_header(original_stats, compressed_stats, compression_ratio)
+    
+    def _generate_markdown_token_header(self, original_stats: Optional[TokenStats], 
+                                       compressed_stats: Optional[TokenStats],
+                                       compression_ratio: Optional[float]) -> str:
+        """Generate markdown-formatted token header"""
+        lines = [
+            "# 🔢 Token Analysis Report",
+            "",
+            "This compressed codebase has been optimized for LLM consumption.",
+            ""
+        ]
+        
+        if compressed_stats:
+            lines.extend([
+                "## 📊 Token Statistics",
+                "",
+                f"- **Output Tokens**: {compressed_stats.total_tokens:,}",
+                f"- **Word Count**: {compressed_stats.word_count:,}",
+                f"- **Character Count**: {compressed_stats.char_count:,}",
+                f"- **Encoding Method**: {compressed_stats.encoding_used}",
+                ""
+            ])
+            
+            # Context window analysis
+            if self.token_counter:
+                context_usage = self.token_counter.estimate_context_usage(compressed_stats)
+                lines.extend([
+                    "## 🎯 Context Window Analysis",
+                    "",
+                    f"- **Context Usage**: {context_usage['usage_percent']:.1f}% of 128K tokens",
+                    f"- **Remaining Capacity**: {context_usage['remaining_tokens']:,} tokens",
+                    f"- **Fits in Single Context**: {'✅ Yes' if context_usage['fits_in_context'] else '❌ No'}",
+                    ""
+                ])
+                
+                if not context_usage['fits_in_context']:
+                    lines.extend([
+                        f"- **Estimated Chunks Needed**: {context_usage['estimated_chunks_needed']}",
+                        ""
+                    ])
+        
+        if original_stats and compressed_stats and compression_ratio:
+            lines.extend([
+                "## 🗜️ Compression Analysis",
+                "",
+                f"- **Original Tokens**: {original_stats.total_tokens:,}",
+                f"- **Compressed Tokens**: {compressed_stats.total_tokens:,}",
+                f"- **Compression Ratio**: {compression_ratio:.2f}:1",
+                f"- **Token Reduction**: {(1 - 1/compression_ratio)*100:.1f}%",
+                ""
+            ])
+        
+        lines.extend([
+            "---",
+            ""
+        ])
+        
+        return "\n".join(lines)
+    
+    def _generate_json_token_header(self, original_stats: Optional[TokenStats], 
+                                   compressed_stats: Optional[TokenStats],
+                                   compression_ratio: Optional[float]) -> str:
+        """Generate JSON-formatted token header"""
+        header_data = {
+            "token_analysis": {
+                "generated_at": datetime.now().isoformat(),
+                "description": "Token analysis for compressed codebase"
+            }
+        }
+        
+        if compressed_stats:
+            header_data["token_analysis"]["output_stats"] = compressed_stats.to_dict()
+            
+            if self.token_counter:
+                context_usage = self.token_counter.estimate_context_usage(compressed_stats)
+                header_data["token_analysis"]["context_analysis"] = context_usage
+        
+        if original_stats and compression_ratio:
+            header_data["token_analysis"]["original_stats"] = original_stats.to_dict()
+            header_data["token_analysis"]["compression_ratio"] = compression_ratio
+            header_data["token_analysis"]["token_reduction_percent"] = (1 - 1/compression_ratio) * 100
+        
+        return f"// {json.dumps(header_data, indent=2)}"
+    
+    def _generate_xml_token_header(self, original_stats: Optional[TokenStats], 
+                                  compressed_stats: Optional[TokenStats],
+                                  compression_ratio: Optional[float]) -> str:
+        """Generate XML-formatted token header"""
+        lines = [
+            "<!-- Token Analysis Report -->",
+            "<tokenAnalysis>",
+            f"  <generatedAt>{datetime.now().isoformat()}</generatedAt>",
+            "  <description>Token analysis for compressed codebase</description>"
+        ]
+        
+        if compressed_stats:
+            lines.extend([
+                "  <outputStats>",
+                f"    <totalTokens>{compressed_stats.total_tokens}</totalTokens>",
+                f"    <wordCount>{compressed_stats.word_count}</wordCount>",
+                f"    <charCount>{compressed_stats.char_count}</charCount>",
+                f"    <encodingUsed>{compressed_stats.encoding_used}</encodingUsed>",
+                "  </outputStats>"
+            ])
+            
+            if self.token_counter:
+                context_usage = self.token_counter.estimate_context_usage(compressed_stats)
+                lines.extend([
+                    "  <contextAnalysis>",
+                    f"    <usagePercent>{context_usage['usage_percent']:.1f}</usagePercent>",
+                    f"    <remainingTokens>{context_usage['remaining_tokens']}</remainingTokens>",
+                    f"    <fitsInContext>{str(context_usage['fits_in_context']).lower()}</fitsInContext>",
+                    "  </contextAnalysis>"
+                ])
+        
+        if original_stats and compression_ratio:
+            lines.extend([
+                "  <compressionAnalysis>",
+                f"    <originalTokens>{original_stats.total_tokens}</originalTokens>",
+                f"    <compressedTokens>{compressed_stats.total_tokens}</compressedTokens>",
+                f"    <compressionRatio>{compression_ratio:.2f}</compressionRatio>",
+                f"    <tokenReductionPercent>{(1 - 1/compression_ratio)*100:.1f}</tokenReductionPercent>",
+                "  </compressionAnalysis>"
+            ])
+        
+        lines.extend([
+            "</tokenAnalysis>",
+            ""
+        ])
+        
+        return "\n".join(lines)
+    
     def _validate_path(self, base_path: Path, file_path: Path) -> bool:
         """Validate that file_path is secure and within base_path"""
         try:
@@ -2458,6 +2740,34 @@ class CodebaseCompressionPipeline:
         # Combine newly processed and cached metadata (no duplicates)
         all_metadata_list = metadata_list + all_cached_metadata
         
+        # Count tokens in original content before compression
+        original_token_stats = None
+        if self.token_counter:
+            logger.info("Counting tokens in original codebase...")
+            try:
+                # Collect all content from metadata
+                original_content = []
+                for metadata in all_metadata_list:
+                    if hasattr(metadata, 'content') and metadata.content:
+                        original_content.append(metadata.content)
+                    elif hasattr(metadata, 'functions') and metadata.functions:
+                        # Add function signatures and docstrings if available
+                        for func in metadata.functions:
+                            if hasattr(func, 'signature'):
+                                original_content.append(str(func.signature))
+                            if hasattr(func, 'docstring'):
+                                original_content.append(str(func.docstring))
+                
+                # Combine all content and count tokens
+                combined_original_content = "\n".join(str(content) for content in original_content if content)
+                if combined_original_content:
+                    original_token_stats = self.token_counter.count_tokens(combined_original_content)
+                    logger.info(f"Original codebase tokens: {original_token_stats.total_tokens:,}")
+                else:
+                    logger.warning("No content found in metadata for token counting")
+            except Exception as e:
+                logger.warning(f"Failed to count original tokens: {e}")
+        
         if query_filter:
             compressed_data = self.selective_compressor.compress_by_query(
                 query_filter, 
@@ -2531,6 +2841,27 @@ class CodebaseCompressionPipeline:
             codebase_map=codebase_map
         )
         
+        # Count tokens in compressed output
+        compressed_token_stats = None
+        compression_ratio = None
+        if self.token_counter and chunks:
+            logger.info("Counting tokens in compressed output...")
+            try:
+                # Combine all chunks and count tokens
+                combined_compressed_content = "\n".join(chunks)
+                compressed_token_stats = self.token_counter.count_tokens(combined_compressed_content)
+                logger.info(f"Compressed output tokens: {compressed_token_stats.total_tokens:,}")
+                
+                # Calculate compression ratio if we have original stats
+                if original_token_stats:
+                    compression_ratio = self.token_counter.calculate_compression_ratio(
+                        original_token_stats, compressed_token_stats
+                    )
+                    logger.info(f"Token compression ratio: {compression_ratio:.2f}:1 "
+                              f"({(1 - 1/compression_ratio)*100:.1f}% reduction)")
+            except Exception as e:
+                logger.warning(f"Failed to count compressed tokens: {e}")
+        
         # Stage 6: Write output files
         logger.info("Stage 6: Writing output files...")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2547,7 +2878,20 @@ class CodebaseCompressionPipeline:
         
         for i, chunk in enumerate(chunks):
             output_file = self.output_dir / f"compressed_{i:04d}.{output_format}"
-            output_file.write_text(chunk)
+            
+            # Add token summary to the first file
+            if i == 0 and (original_token_stats or compressed_token_stats):
+                token_header = self._generate_token_header(
+                    original_token_stats, 
+                    compressed_token_stats, 
+                    compression_ratio,
+                    output_format
+                )
+                final_content = token_header + "\n\n" + chunk
+            else:
+                final_content = chunk
+                
+            output_file.write_text(final_content)
             output_files.append(output_file)
         
         logger.info(f"Created {len(output_files)} output files")
@@ -2561,6 +2905,37 @@ class CodebaseCompressionPipeline:
             report_file = self.output_dir / 'performance_report.json'
             with open(report_file, 'w') as f:
                 json.dump(report, f, indent=2)
+        
+        # Display token compression summary
+        if original_token_stats and compressed_token_stats:
+            logger.info("=" * 60)
+            logger.info("TOKEN COMPRESSION SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Original tokens:    {original_token_stats.total_tokens:,}")
+            logger.info(f"Compressed tokens:  {compressed_token_stats.total_tokens:,}")
+            logger.info(f"Compression ratio:  {compression_ratio:.2f}:1")
+            logger.info(f"Token reduction:    {(1 - 1/compression_ratio)*100:.1f}%")
+            logger.info(f"Encoding method:    {compressed_token_stats.encoding_used}")
+            
+            # Context window analysis
+            context_usage = self.token_counter.estimate_context_usage(compressed_token_stats)
+            logger.info(f"Context usage:      {context_usage['usage_percent']:.1f}% of 128K limit")
+            logger.info(f"Remaining tokens:   {context_usage['remaining_tokens']:,}")
+            
+            if context_usage['fits_in_context']:
+                logger.info("✅ Compressed output fits in single LLM context window")
+            else:
+                logger.info(f"⚠️  Output requires {context_usage['estimated_chunks_needed']} context windows")
+            logger.info("=" * 60)
+        elif compressed_token_stats:
+            logger.info("=" * 60)
+            logger.info("TOKEN COUNT SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Output tokens:      {compressed_token_stats.total_tokens:,}")
+            logger.info(f"Encoding method:    {compressed_token_stats.encoding_used}")
+            context_usage = self.token_counter.estimate_context_usage(compressed_token_stats)
+            logger.info(f"Context usage:      {context_usage['usage_percent']:.1f}% of 128K limit")
+            logger.info("=" * 60)
         
         return output_files
 
