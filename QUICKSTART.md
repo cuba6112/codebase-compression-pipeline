@@ -31,7 +31,7 @@ async def compress_project():
     )
     
     # Process codebase
-    output_files = await pipeline.process_codebase(
+    output_files = await pipeline.process_codebase_async(
         codebase_path=Path('./my_project'),
         output_format='markdown'  # or 'json', 'xml'
     )
@@ -95,7 +95,7 @@ output_files = await pipeline.process_codebase_resilient(
 ### 3. With Custom Ignore Patterns
 
 ```python
-output_files = await pipeline.process_codebase(
+output_files = await pipeline.process_codebase_async(
     codebase_path=Path('./my_project'),
     ignore_patterns=[
         'node_modules',
@@ -112,7 +112,7 @@ output_files = await pipeline.process_codebase(
 
 ```python
 # Process only Python files with high complexity
-output_files = await pipeline.process_codebase(
+output_files = await pipeline.process_codebase_async(
     codebase_path=Path('./my_project'),
     query_filter={
         'language': 'python',
@@ -187,7 +187,7 @@ monitor = PipelineMonitor()
 monitor.start_monitoring()
 
 # Process with monitoring
-await pipeline.process_codebase(Path('./project'))
+await pipeline.process_codebase_async(Path('./project'))
 
 # Get performance metrics
 metrics = monitor.get_summary()

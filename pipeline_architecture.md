@@ -344,7 +344,7 @@ chunk_strategy = 'semantic'  # or 'size', 'balanced'
 ### 1. Full Codebase Analysis
 ```python
 # Process entire codebase with structural compression
-output = await pipeline.process_codebase(
+output = await pipeline.process_codebase_async(
     codebase_path=Path('./project'),
     compression_strategy='structural'
 )
@@ -353,7 +353,7 @@ output = await pipeline.process_codebase(
 ### 2. Targeted Extraction
 ```python
 # Extract only complex Python files
-output = await pipeline.process_codebase(
+output = await pipeline.process_codebase_async(
     codebase_path=Path('./project'),
     query_filter={
         'language': 'python',
@@ -366,7 +366,7 @@ output = await pipeline.process_codebase(
 ### 3. Dependency Analysis
 ```python
 # Find all files importing specific module
-output = await pipeline.process_codebase(
+output = await pipeline.process_codebase_async(
     codebase_path=Path('./project'),
     query_filter={
         'imports': 'tensorflow'
@@ -379,7 +379,7 @@ output = await pipeline.process_codebase(
 ```python
 # Process only changes since last run
 pipeline.cache.cleanup_expired()  # Clean old entries
-output = await pipeline.process_codebase(
+output = await pipeline.process_codebase_async(
     codebase_path=Path('./project'),
     compression_strategy='structural'
 )
@@ -393,7 +393,7 @@ output = await pipeline.process_codebase(
 pipeline.optimizer.profiling_enabled = True
 
 # Process codebase
-await pipeline.process_codebase(...)
+await pipeline.process_codebase_async(...)
 
 # Get performance report
 report = pipeline.optimizer.get_performance_report()

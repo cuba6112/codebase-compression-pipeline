@@ -137,7 +137,7 @@ async def main():
     ]
     
     # Process codebase
-    output_files = await pipeline.process_codebase(
+    output_files = await pipeline.process_codebase_async(
         codebase_path=codebase_path,
         output_format=output_format,
         compression_strategy=compression_strategy,

@@ -110,8 +110,9 @@ class PathValidator:
     def __init__(self, config: SecurityConfig):
         self.config = config
         
-    def validate_path(self, path: Union[str, Path], 
-                     base_path: Optional[Path] = None) -> Optional[Path]:
+    def validate_path(self, path: Union[str, Path],
+                     base_path: Optional[Path] = None,
+                     must_exist: bool = True) -> Optional[Path]:
         """Validate and sanitize a file path"""
         try:
             # Convert to Path object
@@ -133,17 +134,20 @@ class PathValidator:
                 if path.exists() and path.is_symlink():
                     logger.error(f"Symbolic links not allowed by default: {path}")
                     return None
-                    
+
                 # Use strict resolution in Python 3.10+
                 if sys.version_info >= (3, 10):
                     try:
-                        path = path.resolve(strict=True)
+                        path = path.resolve(strict=must_exist)
                     except (FileNotFoundError, RuntimeError) as e:
                         logger.error(f"Path resolution failed: {e}")
-                        return None
+                        if must_exist:
+                            return None
+                        # Resolve without strict mode when path is expected to be created
+                        path = path.resolve()
                 else:
                     path = path.resolve()
-                    if not path.exists():
+                    if must_exist and not path.exists():
                         logger.error(f"Path does not exist: {path}")
                         return None
             
