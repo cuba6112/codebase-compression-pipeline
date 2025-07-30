@@ -97,6 +97,22 @@ class MetadataStore:
         self._total_entries += 1
         return idx
     
+    def add_metadata_batch(self, metadata_list: List[FileMetadata]) -> List[int]:
+        """
+        Add multiple metadata entries in batch for better performance.
+        
+        Args:
+            metadata_list: List of FileMetadata objects to add
+            
+        Returns:
+            List of indices where metadata was stored
+        """
+        indices = []
+        for metadata in metadata_list:
+            idx = self.add_metadata(metadata)
+            indices.append(idx)
+        return indices
+    
     def query(self, **criteria) -> List[int]:
         """
         Query metadata with multiple criteria.

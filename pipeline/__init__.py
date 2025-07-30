@@ -2,8 +2,13 @@
 Codebase compression pipeline modules.
 """
 
-from .core import CodebaseCompressionPipeline
+# Import pipeline stages
+from .stages.compression import StreamingCompressor
+from .stages.metadata import MetadataStore
+from .workers.parallel_processor import ParallelProcessor
 
 __all__ = [
-    'CodebaseCompressionPipeline',
+    'StreamingCompressor',
+    'MetadataStore',
+    'ParallelProcessor',
 ]

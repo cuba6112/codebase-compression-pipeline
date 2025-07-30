@@ -28,6 +28,10 @@ import re
 import logging
 import os
 from functools import lru_cache
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import aiofiles
 import weakref
 try:
@@ -675,12 +679,13 @@ class IncrementalCache:
                     if dependencies == "set()":
                         dependencies = set()
                     else:
-                        # Try to parse it as a set
+                        # Try to parse it as a set using safe literal evaluation
                         try:
-                            dependencies = eval(dependencies)
+                            dependencies = ast.literal_eval(dependencies)
                             if not isinstance(dependencies, set):
                                 dependencies = set()
-                        except:
+                        except (ValueError, SyntaxError) as e:
+                            logger.warning(f"Failed to parse dependencies string safely: {type(e).__name__}")
                             dependencies = set()
                 elif not isinstance(dependencies, set):
                     dependencies = set(dependencies) if dependencies else set()
@@ -1733,7 +1738,8 @@ class PerformanceOptimizer:
     
     def _get_memory_usage(self) -> int:
         """Get current memory usage in bytes"""
-        import psutil
+        if psutil is None:
+            return 0  # Fallback if psutil not available
         process = psutil.Process()
         return process.memory_info().rss
 
@@ -2109,7 +2115,11 @@ class CodebaseCompressionPipeline:
             cache_tasks.append(task)
         
         # Add to metadata store using async batch operation
-        metadata_task = self.metadata_store.add_metadata_batch(metadata_list)
+        metadata_task = asyncio.get_event_loop().run_in_executor(
+            None,  # Use default executor
+            self.metadata_store.add_metadata_batch,
+            metadata_list
+        )
         
         # Wait for all operations to complete
         await asyncio.gather(*cache_tasks, metadata_task)
@@ -2538,7 +2548,7 @@ class CodebaseCompressionPipeline:
         logger.info(f"Created {len(output_files)} output files")
         
         # Save metadata store
-        await self.metadata_store.save()
+        self.metadata_store.save()
         
         # Generate performance report
         if self.optimizer.profiling_enabled:
