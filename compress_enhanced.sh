@@ -9,6 +9,14 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # Set Python path (using the conda environment)
 PYTHON_PATH="/opt/anaconda3/bin/python"
 
+# Check if compress_realtime.py exists for best progress bar support
+if [ -f "$SCRIPT_DIR/compress_realtime.py" ]; then
+    exec "$PYTHON_PATH" "$SCRIPT_DIR/compress_realtime.py" "$@"
+# Fall back to compress.py if available
+elif [ -f "$SCRIPT_DIR/compress.py" ]; then
+    exec "$PYTHON_PATH" "$SCRIPT_DIR/compress.py" "$@"
+fi
+
 # Default values
 CODEBASE_PATH="."
 OUTPUT_FORMAT="markdown"
@@ -205,8 +213,9 @@ trap "rm -f '$TEMP_SCRIPT'" EXIT
 # Ensure Rust is in PATH
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Run the Python script
-"$PYTHON_PATH" "$TEMP_SCRIPT" "$SCRIPT_DIR" "$CODEBASE_PATH" "$OUTPUT_FORMAT" "$COMPRESSION_STRATEGY" "$RESET_CACHE"
+# Run the Python script with unbuffered output for real-time progress
+# Direct execution for better progress bar support
+PYTHONUNBUFFERED=1 exec "$PYTHON_PATH" "$TEMP_SCRIPT" "$SCRIPT_DIR" "$CODEBASE_PATH" "$OUTPUT_FORMAT" "$COMPRESSION_STRATEGY" "$RESET_CACHE"
 EXIT_CODE=$?
 
 # Exit with the same code as the Python script

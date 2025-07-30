@@ -48,6 +48,8 @@ from parsers.enhanced_js_parser import EnhancedJavaScriptParser
 # Import Python parser
 from parsers.python_parser import PythonParser
 # Import TypeScript parser (will be done after logger is initialized)
+# Import the enhanced async MetadataStore
+from pipeline.stages.metadata import MetadataStore as AsyncMetadataStore
 TYPESCRIPT_PARSER_AVAILABLE = False
 TypeScriptParser = None
 # Import resilience patterns
@@ -143,6 +145,9 @@ class ParallelProcessor:
         self._executors = weakref.WeakSet()
         self._executors.add(self.executor)
         self._executors.add(self.thread_executor)
+        # Track active tasks for proper cleanup
+        self._active_tasks = set()
+        self._task_lock = asyncio.Lock()
     
     def _cleanup_partial_init(self):
         """Clean up partially initialized components"""
@@ -194,13 +199,29 @@ class ParallelProcessor:
         
     async def start_health_monitoring(self):
         """Start health monitoring if enabled"""
-        if self.enable_resilience:
-            await self.health_checker.start()
+        if self.enable_resilience and hasattr(self, 'health_checker'):
+            try:
+                async with self._task_lock:
+                    if not self._health_monitor_task or self._health_monitor_task.done():
+                        self._health_monitor_task = asyncio.create_task(self.health_checker.start())
+                        self._active_tasks.add(self._health_monitor_task)
+                        self._health_monitor_task.add_done_callback(self._active_tasks.discard)
+            except Exception as e:
+                logger.error(f"Failed to start health monitoring: {e}")
             
     async def stop_health_monitoring(self):
         """Stop health monitoring if enabled"""
-        if self.enable_resilience:
-            await self.health_checker.stop()
+        if self.enable_resilience and hasattr(self, 'health_checker'):
+            try:
+                await self.health_checker.stop()
+                if self._health_monitor_task and not self._health_monitor_task.done():
+                    self._health_monitor_task.cancel()
+                    try:
+                        await self._health_monitor_task
+                    except asyncio.CancelledError:
+                        pass
+            except Exception as e:
+                logger.error(f"Error stopping health monitoring: {e}")
     
     def __enter__(self):
         """Context manager entry"""
@@ -212,8 +233,27 @@ class ParallelProcessor:
         return False
     
     
-    def shutdown(self):
-        """Shutdown all executors"""
+    async def shutdown_async(self):
+        """Async shutdown with proper task cleanup"""
+        # Cancel all active tasks
+        async with self._task_lock:
+            tasks = list(self._active_tasks)
+            for task in tasks:
+                task.cancel()
+            
+            # Wait for all tasks to complete or be cancelled
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            
+            self._active_tasks.clear()
+        
+        # Shutdown executors in thread to avoid blocking
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._shutdown_executors
+        )
+    
+    def _shutdown_executors(self):
+        """Shutdown all executors synchronously"""
         for executor in list(self._executors):
             try:
                 executor.shutdown(wait=True)
@@ -221,6 +261,10 @@ class ParallelProcessor:
                 logger.error(f"Runtime error shutting down executor: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error shutting down executor: {e}", exc_info=True)
+    
+    def shutdown(self):
+        """Synchronous shutdown for backward compatibility"""
+        self._shutdown_executors()
         
     async def process_files_parallel(self, 
                                    file_paths: List[Path],
@@ -251,53 +295,71 @@ class ParallelProcessor:
         
         # Worker coroutine
         async def worker():
-            while True:
-                batch = await work_queue.get()
-                if batch is None:
-                    break
-                
-                # Process batch in thread pool
-                try:
-                    results = await asyncio.get_running_loop().run_in_executor(
-                        self.thread_executor,
-                        self._process_batch,
-                        batch,
-                        parser_factory
-                    )
+            try:
+                while True:
+                    batch = await work_queue.get()
+                    if batch is None:
+                        break
                     
-                    for result in results:
-                        if result:
-                            await result_queue.put(result)
-                except asyncio.CancelledError:
-                    logger.info("Worker task cancelled")
-                    raise
-                except asyncio.TimeoutError as e:
-                    logger.error(f"Worker timeout processing batch: {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error in worker: {e}", exc_info=True)
-                    # Continue processing other batches
-            
-            # Signal completion
-            await result_queue.put(None)
+                    # Process batch in thread pool
+                    try:
+                        results = await asyncio.get_running_loop().run_in_executor(
+                            self.thread_executor,
+                            self._process_batch,
+                            batch,
+                            parser_factory
+                        )
+                        
+                        for result in results:
+                            if result:
+                                await result_queue.put(result)
+                    except asyncio.CancelledError:
+                        logger.info("Worker task cancelled")
+                        raise
+                    except asyncio.TimeoutError as e:
+                        logger.error(f"Worker timeout processing batch: {e}")
+                    except Exception as e:
+                        logger.error(f"Unexpected error in worker: {e}", exc_info=True)
+                        # Continue processing other batches
+            finally:
+                # Signal completion even if cancelled
+                await result_queue.put(None)
         
-        # Run workers concurrently
-        workers = [asyncio.create_task(worker()) for _ in range(self.num_workers)]
+        # Run workers concurrently with proper task tracking
+        workers = []
+        async with self._task_lock:
+            for _ in range(self.num_workers):
+                task = asyncio.create_task(worker())
+                workers.append(task)
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
+        
         logger.debug(f"Created {len(workers)} worker tasks")
         
-        # Collect results
-        completed_workers = 0
-        while completed_workers < self.num_workers:
-            logger.debug(f"Waiting for results, completed workers: {completed_workers}/{self.num_workers}")
-            result = await result_queue.get()
-            if result is None:
-                completed_workers += 1
-                logger.debug(f"Worker completed, total: {completed_workers}")
-            else:
-                yield result
-        
-        # Wait for all workers to complete
-        await asyncio.gather(*workers)
-        logger.debug("All workers completed")
+        # Collect results with proper cleanup
+        try:
+            completed_workers = 0
+            while completed_workers < self.num_workers:
+                logger.debug(f"Waiting for results, completed workers: {completed_workers}/{self.num_workers}")
+                try:
+                    result = await result_queue.get()
+                    if result is None:
+                        completed_workers += 1
+                        logger.debug(f"Worker completed, total: {completed_workers}")
+                    else:
+                        yield result
+                except asyncio.CancelledError:
+                    logger.info("Result collection cancelled")
+                    raise
+        finally:
+            # Ensure all workers are properly cleaned up
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            
+            # Wait for all workers to complete or be cancelled
+            await asyncio.gather(*workers, return_exceptions=True)
+            logger.debug("All workers cleaned up")
     
     def _process_batch(self, 
                       batch: List[Path], 
@@ -400,28 +462,48 @@ class ParallelProcessor:
         return language_map.get(suffix, 'unknown')
     
     async def _merge_async_iterators(self, iterators):
-        """Merge multiple async iterators"""
+        """Merge multiple async iterators with proper task management"""
         queue = asyncio.Queue()
         finished = set()
         
         async def drain(it, idx):
-            async for item in it:
-                await queue.put((idx, item))
-            finished.add(idx)
-        
-        # Start draining all iterators
-        tasks = []
-        for idx, it in enumerate(iterators):
-            task = asyncio.create_task(drain(it, idx))
-            tasks.append(task)
-        
-        # Yield items as they arrive
-        while len(finished) < len(iterators):
             try:
-                idx, item = await asyncio.wait_for(queue.get(), timeout=0.1)
-                yield item
-            except asyncio.TimeoutError:
-                continue
+                async for item in it:
+                    await queue.put((idx, item))
+            except asyncio.CancelledError:
+                logger.debug(f"Iterator {idx} drain cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Error draining iterator {idx}: {e}")
+            finally:
+                finished.add(idx)
+        
+        # Start draining all iterators with task tracking
+        tasks = []
+        async with self._task_lock:
+            for idx, it in enumerate(iterators):
+                task = asyncio.create_task(drain(it, idx))
+                tasks.append(task)
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
+        
+        try:
+            # Yield items as they arrive
+            while len(finished) < len(iterators):
+                try:
+                    idx, item = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    yield item
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    logger.info("Merge cancelled")
+                    raise
+        finally:
+            # Clean up all drain tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ============================================================================
@@ -564,6 +646,9 @@ class IncrementalCache:
         self._sync_lock = self._enhanced_cache._memory_lock
         self.index = self._enhanced_cache.index
         
+        # Add async lock for async operations
+        self._async_operation_lock = asyncio.Lock()
+        
     def _load_index(self) -> Dict[str, Dict[str, Any]]:
         """Load cache index from disk with proper file locking"""
         # Delegate to enhanced cache
@@ -580,6 +665,49 @@ class IncrementalCache:
         data = self._enhanced_cache.get_cached_metadata(file_path, content_hash)
         if data is not None and isinstance(data, FileMetadata):
             return data
+        elif data is not None and isinstance(data, dict):
+            # Convert dictionary to FileMetadata object
+            try:
+                # Handle dependencies field - convert from string representation or keep as set
+                dependencies = data.get('dependencies', set())
+                if isinstance(dependencies, str):
+                    # Handle string representation of set like "set()"
+                    if dependencies == "set()":
+                        dependencies = set()
+                    else:
+                        # Try to parse it as a set
+                        try:
+                            dependencies = eval(dependencies)
+                            if not isinstance(dependencies, set):
+                                dependencies = set()
+                        except:
+                            dependencies = set()
+                elif not isinstance(dependencies, set):
+                    dependencies = set(dependencies) if dependencies else set()
+                
+                # Create FileMetadata object from dictionary
+                metadata = FileMetadata(
+                    path=data['path'],
+                    size=data['size'],
+                    language=data['language'],
+                    last_modified=data['last_modified'],
+                    content_hash=data['content_hash'],
+                    imports=data.get('imports', []),
+                    exports=data.get('exports', []),
+                    functions=data.get('functions', []),
+                    classes=data.get('classes', []),
+                    dependencies=dependencies,
+                    complexity_score=data.get('complexity_score', 0.0),
+                    token_count=data.get('token_count', 0),
+                    relative_path=data.get('relative_path', ''),
+                    module_path=data.get('module_path', ''),
+                    file_type=data.get('file_type', ''),
+                    external_dependencies=data.get('external_dependencies', [])
+                )
+                return metadata
+            except (KeyError, TypeError) as e:
+                logger.error(f"Failed to convert cache dict to FileMetadata: {e}")
+                return None
         elif data is not None:
             logger.error(f"Invalid cached data type: {type(data)}")
         return None
@@ -621,7 +749,7 @@ class IncrementalCache:
         current_time = time.time()
         expired = []
         
-        for file_path, entry in self.index.items():
+        for file_path, entry in list(self.index.items()):
             if current_time - entry['timestamp'] > self.ttl_seconds:
                 expired.append(file_path)
                 cache_file = self.cache_dir / entry['cache_file']
@@ -1625,6 +1753,10 @@ class CodebaseCompressionPipeline:
                  security_config: Optional[SecurityConfig] = None,
                  redis_config: Optional['RedisCacheConfig'] = None,
                  enable_adaptive_compression: bool = True):
+        # Track active tasks for cleanup
+        self._active_tasks = set()
+        self._task_lock = asyncio.Lock()
+        self._health_monitor_task = None
         # Initialize security first
         self.security_config = security_config or SecurityConfig()
         self.security_validator = SecurityValidator(self.security_config)
@@ -1694,7 +1826,7 @@ class CodebaseCompressionPipeline:
             else:
                 self.cache = IncrementalCache(cache_dir)
                 
-            self.metadata_store = MetadataStore(cache_dir / 'metadata')
+            self.metadata_store = AsyncMetadataStore(cache_dir / 'metadata')
             self.compressor = StreamingCompressor(
                 adaptive_compression=enable_adaptive_compression,
                 cache_dir=cache_dir / 'adaptive_compression'
@@ -1807,13 +1939,29 @@ class CodebaseCompressionPipeline:
         
     async def start_health_monitoring(self):
         """Start health monitoring if enabled"""
-        if self.enable_resilience:
-            await self.health_checker.start()
+        if self.enable_resilience and hasattr(self, 'health_checker'):
+            try:
+                async with self._task_lock:
+                    if not self._health_monitor_task or self._health_monitor_task.done():
+                        self._health_monitor_task = asyncio.create_task(self.health_checker.start())
+                        self._active_tasks.add(self._health_monitor_task)
+                        self._health_monitor_task.add_done_callback(self._active_tasks.discard)
+            except Exception as e:
+                logger.error(f"Failed to start health monitoring: {e}")
             
     async def stop_health_monitoring(self):
         """Stop health monitoring if enabled"""
-        if self.enable_resilience:
-            await self.health_checker.stop()
+        if self.enable_resilience and hasattr(self, 'health_checker'):
+            try:
+                await self.health_checker.stop()
+                if self._health_monitor_task and not self._health_monitor_task.done():
+                    self._health_monitor_task.cancel()
+                    try:
+                        await self._health_monitor_task
+                    except asyncio.CancelledError:
+                        pass
+            except Exception as e:
+                logger.error(f"Error stopping health monitoring: {e}")
             
     async def process_codebase_resilient(self,
                                        codebase_path: Path,
@@ -1889,17 +2037,58 @@ class CodebaseCompressionPipeline:
         if hasattr(self, 'processor'):
             self.processor.shutdown()
         if self.enable_resilience and hasattr(self, 'health_checker'):
-            # Stop health monitoring synchronously
+            # Stop health monitoring synchronously if possible
             try:
-                asyncio.create_task(self.stop_health_monitoring())
+                # Try to get the current event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Schedule cleanup for later
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self.stop_health_monitoring())
+                    )
+                else:
+                    # Run cleanup synchronously
+                    loop.run_until_complete(self.stop_health_monitoring())
             except RuntimeError as e:
-                # No event loop running - this is expected during shutdown
-                logger.debug(f"Could not create task during shutdown: {e}")
+                # No event loop - this is expected during shutdown
+                logger.debug(f"Could not stop health monitoring during shutdown: {e}")
         return False
     
     
+    async def cleanup_async(self):
+        """Async cleanup of all resources"""
+        logger.info("Starting async cleanup...")
+        
+        # Cancel all active tasks
+        async with self._task_lock:
+            tasks = list(self._active_tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for all tasks to complete or be cancelled
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            
+            self._active_tasks.clear()
+        
+        # Stop health monitoring
+        await self.stop_health_monitoring()
+        
+        # Shutdown processor with async method
+        if hasattr(self, 'processor'):
+            await self.processor.shutdown_async()
+        
+        # Save cache index
+        if hasattr(self, 'cache'):
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.cache._save_index
+            )
+        
+        logger.info("Async cleanup completed")
+    
     def cleanup(self):
-        """Clean up all resources"""
+        """Clean up all resources synchronously"""
         if hasattr(self, 'processor'):
             self.processor.shutdown()
         if hasattr(self, 'cache'):
@@ -1907,16 +2096,23 @@ class CodebaseCompressionPipeline:
     
     async def _cache_metadata_batch(self, metadata_list: List[FileMetadata]):
         """Cache multiple metadata entries efficiently in async context"""
-        # Process metadata in batches to minimize lock contention
+        # Process caching and metadata store operations concurrently
+        cache_tasks = []
+        
+        # Create tasks for caching (still using executor for thread safety)
         for metadata in metadata_list:
-            # Cache synchronously but without blocking the event loop
-            await asyncio.get_event_loop().run_in_executor(
+            task = asyncio.get_event_loop().run_in_executor(
                 None,  # Use default executor
                 self.cache.cache_metadata,
                 metadata
             )
-            # Add to metadata store synchronously (it's fast)
-            self.metadata_store.add_metadata(metadata)
+            cache_tasks.append(task)
+        
+        # Add to metadata store using async batch operation
+        metadata_task = self.metadata_store.add_metadata_batch(metadata_list)
+        
+        # Wait for all operations to complete
+        await asyncio.gather(*cache_tasks, metadata_task)
     
     def _populate_metadata_fields(self, metadata: FileMetadata, base_path: Path):
         """Populate additional metadata fields for enhanced mapping"""
@@ -2010,7 +2206,7 @@ class CodebaseCompressionPipeline:
                              compression_strategy: str = 'structural',
                              query_filter: Optional[Dict[str, Any]] = None,
                              ignore_patterns: Optional[List[str]] = None) -> List[Path]:
-        """Process entire codebase through the pipeline"""
+        """Process entire codebase through the pipeline with proper cleanup"""
         
         # Check rate limiting
         if not self.security_validator.rate_limiter.allow_request():
@@ -2199,30 +2395,29 @@ class CodebaseCompressionPipeline:
         if not files_to_process:
             logger.info("No files to process, skipping parallel processing")
         elif TQDM_AVAILABLE:
-            # Create progress bar
-            progress_bar = tqdm(
-                total=len(files_to_process),
-                desc="Processing files",
-                unit="files",
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
-            )
-            
-            # Collect all metadata first to avoid threading issues in async context
-            async for metadata in self.processor.process_files_parallel(files_to_process, self.parsers):
-                # Populate new fields
-                self._populate_metadata_fields(metadata, codebase_path)
-                metadata_list.append(metadata)
-                progress_bar.update(1)
-            
-            progress_bar.close()
-            
+            pbar = tqdm(total=len(files_to_process), desc="Processing files", unit="files", mininterval=0.1, maxinterval=0.5)
+            try:
+                processed_count = 0
+                async for metadata in self.processor.process_files_parallel(files_to_process, self.parsers, batch_size=1):
+                    logger.debug(f"Received metadata for: {metadata.path}")
+                    self._populate_metadata_fields(metadata, codebase_path)
+                    metadata_list.append(metadata)
+                    processed_count += 1
+                    pbar.update(1)
+                
+                # Update progress bar to 100% if not all files produced metadata
+                if processed_count < len(files_to_process):
+                    pbar.update(len(files_to_process) - processed_count)
+                    logger.info(f"Processed {processed_count} files out of {len(files_to_process)} (some were skipped)")
+            finally:
+                pbar.close()
             # Cache metadata after processing to avoid deadlock
             logger.info("Caching processed metadata...")
             # Use batch caching to minimize lock contention
             await self._cache_metadata_batch(metadata_list)
         else:
             # Collect all metadata first
-            async for metadata in self.processor.process_files_parallel(files_to_process, self.parsers):
+            async for metadata in self.processor.process_files_parallel(files_to_process, self.parsers, batch_size=1):
                 # Populate new fields
                 self._populate_metadata_fields(metadata, codebase_path)
                 metadata_list.append(metadata)
@@ -2233,25 +2428,27 @@ class CodebaseCompressionPipeline:
         
         # Stage 4: Query-based selection
         logger.info("Stage 4: Applying query filters...")
+        
+        # Get all cached metadata for files we didn't just process
+        all_cached_metadata = []
+        processed_paths = {m.path for m in metadata_list}
+        
+        for file_path in current_files:
+            # Only get cached metadata for files we didn't just process
+            if str(file_path) not in processed_paths:
+                cached_meta = self.cache.get_cached_metadata(str(file_path), current_files[file_path])
+                if cached_meta:
+                    all_cached_metadata.append(cached_meta)
+        
+        # Combine newly processed and cached metadata (no duplicates)
+        all_metadata_list = metadata_list + all_cached_metadata
+        
         if query_filter:
             compressed_data = self.selective_compressor.compress_by_query(
                 query_filter, 
                 compression_strategy
             )
         else:
-            # Get all cached metadata for files we didn't just process
-            all_cached_metadata = []
-            processed_paths = {m.path for m in metadata_list}
-            
-            for file_path in current_files:
-                # Only get cached metadata for files we didn't just process
-                if str(file_path) not in processed_paths:
-                    cached_meta = self.cache.get_cached_metadata(str(file_path), current_files[file_path])
-                    if cached_meta:
-                        all_cached_metadata.append(cached_meta)
-            
-            # Combine newly processed and cached metadata (no duplicates)
-            all_metadata_list = metadata_list + all_cached_metadata
             
             # Compress all files based on strategy
             compress_func = self.selective_compressor.compression_strategies.get(
@@ -2341,7 +2538,7 @@ class CodebaseCompressionPipeline:
         logger.info(f"Created {len(output_files)} output files")
         
         # Save metadata store
-        self.metadata_store.save()
+        await self.metadata_store.save()
         
         # Generate performance report
         if self.optimizer.profiling_enabled:
@@ -2358,31 +2555,88 @@ class CodebaseCompressionPipeline:
 # ============================================================================
 
 async def main():
-    """Example usage of the pipeline"""
+    """Example usage of the pipeline with proper cleanup"""
+    pipeline = None
     
-    # Configure pipeline
-    pipeline = CodebaseCompressionPipeline(
-        cache_dir=Path('./cache'),
-        output_dir=Path('./output'),
-        num_workers=4
-    )
+    try:
+        # Configure pipeline
+        pipeline = CodebaseCompressionPipeline(
+            cache_dir=Path('./cache'),
+            output_dir=Path('./output'),
+            num_workers=4
+        )
+        
+        # Process codebase with specific query
+        query = {
+            'language': 'python',
+            'min_complexity': 5.0,
+            'imports': 'numpy'
+        }
+        
+        output_files = await pipeline.process_codebase(
+            codebase_path=Path('.'),
+            output_format='markdown',
+            compression_strategy='structural',
+            query_filter=query
+        )
+        
+        logger.info(f"Pipeline completed. Output files: {output_files}")
+        
+    except asyncio.CancelledError:
+        logger.info("Pipeline cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}", exc_info=True)
+        raise
+    finally:
+        # Ensure proper cleanup
+        if pipeline:
+            await pipeline.cleanup_async()
+
+
+def run_pipeline():
+    """Run pipeline with proper signal handling"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Process codebase with specific query
-    query = {
-        'language': 'python',
-        'min_complexity': 5.0,
-        'imports': 'numpy'
-    }
+    # Handle shutdown signals
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}, shutting down...")
+        # Use asyncio.all_tasks() for Python 3.8 compatibility, or asyncio.tasks.all_tasks() for 3.7-3.8
+        try:
+            tasks = asyncio.all_tasks(loop)
+        except AttributeError:
+            # For Python 3.9+
+            tasks = asyncio.tasks.all_tasks(loop) if hasattr(asyncio.tasks, 'all_tasks') else set()
+        
+        for task in tasks:
+            task.cancel()
     
-    output_files = await pipeline.process_codebase(
-        codebase_path=Path('./my_project'),
-        output_format='markdown',
-        compression_strategy='structural',
-        query_filter=query
-    )
+    import signal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
-    logger.info(f"Pipeline completed. Output files: {output_files}")
+    try:
+        loop.run_until_complete(main())
+    except asyncio.CancelledError:
+        logger.info("Pipeline execution cancelled")
+    finally:
+        # Clean up any remaining tasks
+        try:
+            pending = asyncio.all_tasks(loop)
+        except AttributeError:
+            # For Python 3.9+
+            pending = asyncio.tasks.all_tasks(loop) if hasattr(asyncio.tasks, 'all_tasks') else set()
+        
+        for task in pending:
+            task.cancel()
+        
+        # Wait for all tasks to complete
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        
+        loop.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_pipeline()
