@@ -121,6 +121,22 @@ output_files = await pipeline.process_codebase_async(
 )
 ```
 
+### 5. Adaptive Configuration
+
+```python
+from pipeline_configs import AdaptiveConfig
+
+# Automatically tune settings based on system resources
+config = AdaptiveConfig.auto_configure(Path('./my_project'))
+
+pipeline = CodebaseCompressionPipeline(
+    cache_dir=Path('./cache'),
+    output_dir=Path('./output'),
+    num_workers=config.num_workers,
+    batch_size=config.batch_size
+)
+```
+
 ## Output Formats
 
 ### 1. Markdown (Default)

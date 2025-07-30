@@ -9,9 +9,11 @@ A high-performance, scalable pipeline for compressing large codebases into optim
 - **Streaming Architecture**: Memory-efficient processing of arbitrarily large codebases
 - **Parallel Processing**: Work-stealing queue implementation for optimal CPU utilization
 - **Advanced Caching**: Content-hash based incremental processing with LZ4 compression
+- **Adaptive Compression**: Automatically selects the best algorithm (LZ4, Zstd, Brotli, etc.) per file type
 - **Security Validation**: Built-in security scanning and input validation
 - **Real-time Monitoring**: Performance tracking with bottleneck detection
 - **Resilience Patterns**: Circuit breakers, retry logic, and fallback mechanisms
+- **Adaptive Configuration**: Auto-tunes pipeline settings based on system resources and codebase size
 
 ## 🏗️ Architecture
 
@@ -121,6 +123,16 @@ config = ConfigPresets.real_time()
 config = ConfigPresets.maximum_compression()
 ```
 
+### Adaptive Configuration
+
+Automatically tune configuration based on the target codebase and available system resources:
+
+```python
+from pipeline_configs import AdaptiveConfig
+
+config = AdaptiveConfig.auto_configure(Path('./my_project'))
+```
+
 ## 🔧 Advanced Features
 
 ### Security Validation
@@ -144,6 +156,7 @@ Real-time metrics for:
 - **Local**: File-based caching with LZ4 compression
 - **Redis**: Distributed caching for multi-instance deployments
 - **Hybrid**: Combines local and Redis for optimal performance
+- **TTL Expiration**: Automatically prunes stale cache entries
 
 ## 🧪 Testing
 
