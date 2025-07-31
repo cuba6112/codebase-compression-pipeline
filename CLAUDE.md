@@ -92,7 +92,7 @@ mypy .                     # Type checking
 pre-commit run --all-files # Run pre-commit hooks
 ```
 
-Note: The project uses conda Python at `/opt/anaconda3/bin/python`
+Note: The shell scripts automatically detect Python 3 from PATH, conda, or system locations
 
 ## High-Level Architecture
 
@@ -183,7 +183,7 @@ async def compress_project():
         num_workers=4
     )
 
-    output_files = await pipeline.process_codebase(
+    output_files = await pipeline.process_codebase_async(
         codebase_path=Path('./my_project'),
         output_format='markdown',
         compression_strategy='structural',

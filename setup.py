@@ -24,7 +24,7 @@ setup(
     description="High-performance pipeline for compressing codebases for LLM context optimization",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/your-username/codebase-compression-pipeline",
+    url="https://github.com/cuba6112/codebase-compression-pipeline",
     packages=find_packages(include=['codebase_compression_pipeline*', 'parsers*', 'pipeline*']),
     py_modules=[
         'codebase_compression_pipeline',
@@ -127,8 +127,8 @@ setup(
         "token-reduction",
     ],
     project_urls={
-        "Bug Reports": "https://github.com/your-username/codebase-compression-pipeline/issues",
-        "Source": "https://github.com/your-username/codebase-compression-pipeline",
-        "Documentation": "https://github.com/your-username/codebase-compression-pipeline/wiki",
+        "Bug Reports": "https://github.com/cuba6112/codebase-compression-pipeline/issues",
+        "Source": "https://github.com/cuba6112/codebase-compression-pipeline",
+        "Documentation": "https://github.com/cuba6112/codebase-compression-pipeline/blob/main/README.md",
     },
 )
