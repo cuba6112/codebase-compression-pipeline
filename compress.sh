@@ -6,8 +6,17 @@
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Set Python path (using the conda environment detected earlier)
-PYTHON_PATH="/opt/anaconda3/bin/python"
+# Set Python path - try to detect the best available Python 3
+if command -v python3 &> /dev/null; then
+    PYTHON_PATH="python3"
+elif command -v python &> /dev/null && python --version 2>&1 | grep -q "Python 3"; then
+    PYTHON_PATH="python"
+elif [ -f "/opt/anaconda3/bin/python" ]; then
+    PYTHON_PATH="/opt/anaconda3/bin/python"
+else
+    echo "Error: Python 3 not found. Please install Python 3 or add it to PATH."
+    exit 1
+fi
 
 # Default values
 CODEBASE_PATH="${1:-.}"

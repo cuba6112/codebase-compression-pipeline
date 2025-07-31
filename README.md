@@ -33,7 +33,12 @@ The pipeline processes codebases through 8 distinct stages:
 ### Dependencies
 
 ```bash
-pip install lz4 mmh3 psutil tqdm
+pip install -r requirements.txt
+```
+
+or install core dependencies manually:
+```bash
+pip install lz4>=4.0.0 mmh3>=3.0.0 psutil>=5.9.0 tqdm>=4.65.0 aiofiles>=23.0.0
 ```
 
 ### Optional Dependencies
@@ -198,23 +203,34 @@ Typical performance on modern hardware:
 ## 🛠️ Project Structure
 
 ```
-project_think/
+codebase-compression-pipeline/
 ├── codebase_compression_pipeline.py    # Main pipeline implementation
 ├── pipeline_configs.py                 # Configuration presets
 ├── pipeline_monitoring.py              # Performance monitoring
 ├── security_validation.py              # Security scanning
 ├── parsers/                            # Language-specific parsers
 │   ├── python_parser.py
-│   ├── javascript_parser.py
+│   ├── enhanced_js_parser.py
+│   ├── typescript_parser.py
+│   ├── go_parser.py
+│   ├── rust_parser.py
 │   └── base.py
 ├── pipeline/                           # Pipeline stages
 │   ├── stages/
+│   │   ├── cache.py
+│   │   ├── compression.py
+│   │   ├── formatting.py
+│   │   └── ...
 │   └── workers/
+│       ├── parallel.py
+│       └── parallel_processor.py
 ├── tests/                              # Test suite
 │   ├── unit/
 │   ├── integration/
 │   └── fixtures/
-└── requirements.txt                    # Dependencies
+├── compress.sh                         # Shell wrapper script
+├── requirements.txt                    # Dependencies
+└── setup.py                           # Package configuration
 ```
 
 ## 🤝 Contributing

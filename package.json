@@ -1,14 +1,14 @@
 {
-  "name": "project_think",
+  "name": "codebase-compression-pipeline",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "TypeScript support for codebase compression pipeline",
+  "main": "typescript_ast_parser.cjs",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": ["typescript", "ast", "parser", "compression"],
+  "author": "cuba6112",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "@typescript-eslint/parser": "^8.38.0",
